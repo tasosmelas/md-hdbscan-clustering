@@ -1,0 +1,18 @@
+# Python specific
+__pycache__/
+*.py[cod]
+
+# Molecular Dynamics Data (Heavy files to stay local)
+*.dcd
+*.psf
+*.pdb
+*.xtc
+*.trr
+*.gro
+
+# Results folders (Ignore any folder starting with carma_ or hdbscan_)
+**/carma_results_*/
+**/cluster_results_*/
+
+# OS files
+.DS_Store

@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+"""
+Automating the multidimensional clustering of data derived from a
+Principal Component Analysis of molecular dynamics trajectories using
+HDBSCAN.
+"""
+
+import os
+import sys
+import glob
+import time
+import datetime
+import argparse
+import subprocess
+import warnings
+
+os.environ['PYTHONWARNINGS'] = 'ignore'
+warnings.filterwarnings("ignore") # This catches EVERYTHING
+
+import MDAnalysis as mda
+import logging
+logging.getLogger("MDAnalysis").setLevel(logging.ERROR)
+
+import numpy as np
+import hdbscan
+import matplotlib.pyplot as plt
+
+def plot_landscape(pc_x, pc_y, labels, unique_clusters, xlabel, ylabel, out_prefix):
+    cmap = plt.get_cmap('turbo')
+
+    # ---------- PNG version ----------
+    plt.figure(figsize=(10, 8))
+    plt.scatter(pc_x, pc_y, color='lightgrey', s=1, alpha=0.5, label='Background / Noise')
+
+    for i, cid in enumerate(unique_clusters):
+        mask = (labels == cid)
+        cluster_color = cmap(i / max(1, (len(unique_clusters) - 1)))
+        plt.scatter(pc_x[mask], pc_y[mask], color=cluster_color, s=2, alpha=0.8, label=f'Cluster {cid}')
+
+    plt.title(f'Plot: {xlabel} vs {ylabel}')
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+
+    if len(unique_clusters) <= 35:
+        plt.legend(markerscale=5, loc='center left', bbox_to_anchor=(1, 0.5))
+    
+    plt.savefig(f"{out_prefix}.png", dpi=600, bbox_inches='tight')
+    plt.close() # Closes the PNG before starting the PS
+
+    # ---------- PS version ----------
+    plt.figure(figsize=(10, 8))
+    plt.scatter(pc_x, pc_y, color='lightgrey', s=1, label='Background / Noise')
+
+    for i, cid in enumerate(unique_clusters):
+        mask = (labels == cid)
+        cluster_color = cmap(i / max(1, (len(unique_clusters) - 1)))[:3] # Drop Alpha for PS
+        plt.scatter(pc_x[mask], pc_y[mask], color=cluster_color, s=2, label=f'Cluster {cid}')
+
+    plt.title(f'Plot: {xlabel} vs {ylabel}')
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    
+    if len(unique_clusters) <= 35:
+        plt.legend(markerscale=5, loc='center left', bbox_to_anchor=(1, 0.5), framealpha=1.0)
+        
+    plt.savefig(f"{out_prefix}.ps", format='ps', bbox_inches='tight')
+    plt.close()
+
+def generate_fes_map(pc_x, pc_y, labels, unique_clusters, results_dir):
+    """Generates a Boltzmann-inverted Free Energy Surface map."""
+    print("[*] Calculating Topographic Free Energy Surface (FES)...")
+    
+    # Calculate 2D Histogram
+    bins = 100
+    hist, xedges, yedges = np.histogram2d(pc_x, pc_y, bins=bins)
+    
+    # Boltzmann Inversion: F = -ln(P/Pmax)
+    max_pop = np.max(hist)
+    # We use a small epsilon to avoid log(0)
+    free_energy = -np.log((hist.T + 1e-10) / max_pop)
+    free_energy[free_energy > 6] = 6.0 # Cap the display at 6 kT for clarity
+    
+    x_centers = (xedges[:-1] + xedges[1:]) / 2
+    y_centers = (yedges[:-1] + yedges[1:]) / 2
+    X, Y = np.meshgrid(x_centers, y_centers)
+
+    fig, ax = plt.subplots(figsize=(12, 10))
+    
+    # Background
+    levels = np.linspace(0, 6, 13)
+    contour = ax.contourf(X, Y, free_energy, levels=levels, cmap='turbo_r', extend='max')
+    
+    # Topographic Lines
+    ax.contour(X, Y, free_energy, levels=levels, colors='black', alpha=0.1, linewidths=0.5)
+
+    # Calculate and Add State Labels at the cluster centers
+    for cid in unique_clusters:
+        mask = (labels == cid)
+        cx, cy = np.mean(pc_x[mask]), np.mean(pc_y[mask])
+        ax.text(cx, cy, str(cid), fontsize=9, fontweight='bold', color='black',
+                ha='center', va='center',
+                bbox=dict(facecolor='white', alpha=0.7, edgecolor='none', pad=1))
+
+    cbar = fig.colorbar(contour)
+    cbar.set_label('Free Energy ($k_B T$)', fontsize=12, fontweight='bold')
+
+    ax.set_title('Free Energy Landscape (PC1 vs PC2)', fontsize=16, fontweight='bold')
+    ax.set_xlabel('Principal Component 1')
+    ax.set_ylabel('Principal Component 2')
+    
+    out_path = os.path.join(results_dir, "FES_Landscape_PC1_vs_PC2.png")
+    plt.savefig(out_path, dpi=600, bbox_inches='tight')
+    plt.close()
+    print(f"[+] FES Map saved to {out_path}")
+
+def main():
+
+    parser = argparse.ArgumentParser(description="Run HDBSCAN on CARMA PCA output.")
+    parser.add_argument('--size', type=int, default=1000, help='Minimum cluster size (Default: 1000)')
+    parser.add_argument('--samples', type=int, default=50, help='Minimum samples (Default: 50)')
+    parser.add_argument('--method', type=str, default='eom', choices=['eom', 'leaf'], help='Selection method (Default: eom)')
+    args = parser.parse_args()
+    print("=== HDBSCAN Clustering ===")
+
+    print("[*] Locating fluctuations file...")
+    
+    fluctuation_files = glob.glob('*fluctuations.dat')
+    
+    if not fluctuation_files:
+        fluctuation_files = glob.glob('carma_results_*/*fluctuations.dat')
+        
+    if not fluctuation_files:
+        print("[-] Error: '*fluctuations.dat' not found.")
+        sys.exit(1)
+
+    data_file = fluctuation_files[0]
+    print(f"[+] Found: {data_file}")
+
+    # Creating output directory
+    timestamp = datetime.datetime.now().strftime("%d.%m.%Y_%H.%M.%S")
+    results_dir = f"cluster_results_{timestamp}"
+    os.makedirs(results_dir, exist_ok=True)
+    print(f"[+] Created output directory: {results_dir}")
+    
+    print("[*] Loading data into memory...")
+    try:
+        raw_data = np.loadtxt(data_file)
+    except Exception as e:
+        print(f"[-] Error loading data: {e}")
+        sys.exit(1)
+        
+    frames = raw_data[:, 0].astype(int)
+    data_nd = raw_data[:, 1:] 
+    total_frames, n_dimensions = data_nd.shape
+    print(f"[+] Successfully loaded {total_frames:,} frames ({n_dimensions}D).")
+
+    # HDBSCAN Execution
+    print(f"\n[*] Running HDBSCAN (Size: {args.size}, Samples: {args.samples}, Method: {args.method})...")
+    start_time = time.time()
+    
+    clusterer = hdbscan.HDBSCAN(
+        min_cluster_size=args.size,
+        min_samples=args.samples,
+        cluster_selection_method=args.method,
+        core_dist_n_jobs=-1
+    )
+    labels = clusterer.fit_predict(data_nd)
+    elapsed = time.time() - start_time
+
+    unique_clusters = np.unique(labels[labels != -1])
+    print(f"[+] Found {len(unique_clusters)} distinct clusters in {elapsed:.2f} seconds.")
+
+    # Populations
+    noise_frames = np.sum(labels == -1)
+    print("\n    Populations:")
+    for cid in unique_clusters:
+        count = np.sum(labels == cid)
+        print(f"      Cluster {cid:2d}: {count:7d} frames ({(count / total_frames) * 100:5.1f}%)")
+    print(f"      Noise   : {noise_frames:7d} frames ({(noise_frames / total_frames) * 100:5.1f}%)")
+
+    # Export Data
+    out_filename = os.path.join(results_dir, f"hdbscan.{n_dimensions}-D.clusters.dat")
+    print(f"\n[*] Exporting coordinate data to {out_filename}...")
+    out_data = np.column_stack((frames, labels, data_nd))
+    fmt_string = f"%10d %4d " + ' '.join(['%11.7f'] * n_dimensions)
+    np.savetxt(out_filename, out_data, fmt=fmt_string)
+
+    # Plotting
+    print("[*] Generating Plots (PNG & PS)...")
+    if n_dimensions >= 2:
+        # 1. Standard Scatter Plot
+        plot_landscape(data_nd[:, 0], data_nd[:, 1], labels, unique_clusters, "PC1", "PC2", os.path.join(results_dir, "landscape_PC1_vs_PC2"))
+        
+        # 2. Free Energy Map
+        generate_fes_map(data_nd[:, 0], data_nd[:, 1], labels, unique_clusters, results_dir)
+        
+        if n_dimensions >= 3:
+            plot_landscape(data_nd[:, 0], data_nd[:, 2], labels, unique_clusters, "PC1", "PC3", os.path.join(results_dir, "landscape_PC1_vs_PC3"))
+            plot_landscape(data_nd[:, 1], data_nd[:, 2], labels, unique_clusters, "PC2", "PC3", os.path.join(results_dir, "landscape_PC2_vs_PC3"))
+
+    # --- AUTOMATED CARMA EXTRACTION (SUPERPOSITION) ---
+    print("\n[*] Starting automated CARMA Structural Extraction...")
+    dcd_files = [f for f in glob.glob('*.dcd') if not f.startswith(('carma', 'cluster'))]
+    psf_files = [f for f in glob.glob('*.psf') if not f.startswith('carma')]
+    
+    if not dcd_files or not psf_files:
+        print("[-] Missing original .dcd or .psf file. Skipping extraction.")
+    else:
+        original_dcd = dcd_files[0]
+        original_psf = psf_files[0]
+        print(f"[+] Found trajectory: {original_dcd}")
+        print(f"[+] Found topology: {original_psf}")
+        
+        for cid in unique_clusters:
+            print(f"    -> Processing Cluster {cid}...")
+            
+            cluster_mask = (labels == cid)
+            cluster_frames = frames[cluster_mask]
+            cluster_coords = data_nd[cluster_mask]
+            
+            # --- MEDOID EXTRACTION ---
+            centroid = np.mean(cluster_coords, axis=0)
+            distances = np.linalg.norm(cluster_coords - centroid, axis=1)
+            medoid_frame = cluster_frames[np.argmin(distances)]
+            print(f"      -> Medoid identified at frame {medoid_frame}")
+
+            # --- SUBPROCESS EXTRACTIONS ---
+            # Step 1: Extract the full cluster DCD (for superposition)
+            frame_list_file = f"temp_frames_cluster_{cid}.dat"
+            np.savetxt(frame_list_file, cluster_frames, fmt='%d')
+            subprocess.run(["carma", "-v", "-sort", frame_list_file, original_dcd], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            
+            final_dcd_name = os.path.join(results_dir, f"cluster_{cid}.dcd")
+            if os.path.exists("carma.reordered.dcd"):
+                os.rename("carma.reordered.dcd", final_dcd_name)
+
+            # Step 2: Generate Superposition PDB (from the DCD) using CARMA
+            subprocess.run(["carma", "-v", "-w", "-cov", "-dot", "-super", "-atmid", "ALLID", final_dcd_name, original_psf], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if os.path.exists("carma.superposition.pdb"):
+                os.rename("carma.superposition.pdb", os.path.join(results_dir, f"cluster_{cid}_superposition.pdb"))
+                
+            if os.path.exists("carma.average.pdb"):
+                os.remove("carma.average.pdb")
+
+            # Step 3: Extract the Medoid PDB using MDAnalysis
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    
+                    # MDAnalysis reads trajectories as 0-indexed
+                    u = mda.Universe(original_psf, original_dcd)
+                    target_frame = int(medoid_frame) - 1 if int(medoid_frame) > 0 else 0 
+                    
+                    u.trajectory[target_frame] 
+                    medoid_out_path = os.path.join(results_dir, f"cluster_{cid}_medoid.pdb")
+                    u.atoms.write(medoid_out_path)
+            except Exception as e:
+                print(f"      [!] Error extracting Medoid for State {cid}: {e}")
+
+            # Cleanup
+            for f in glob.glob("*varcov*") + glob.glob("carma.*") + [frame_list_file]:
+                try: 
+                    os.remove(f)
+                except OSError: 
+                    pass
+        print("\n[+] CARMA extraction complete. DCDs, Superpositions, and Medoids saved.")
+
+    print(f"\n=== Complete. All files saved to {results_dir}/ ===")
+
+if __name__ == "__main__":
+    main()

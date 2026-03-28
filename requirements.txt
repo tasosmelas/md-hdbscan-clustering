@@ -1,0 +1,5 @@
+numpy==1.26.4
+matplotlib==3.10.8
+hdbscan==0.8.41
+MDAnalysis==2.8.0
+scikit-learn==1.6.0
