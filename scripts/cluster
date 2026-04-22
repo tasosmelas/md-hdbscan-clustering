@@ -15,20 +15,19 @@ import subprocess
 import warnings
 
 os.environ['PYTHONWARNINGS'] = 'ignore'
-warnings.filterwarnings("ignore") # This catches EVERYTHING
-
-import MDAnalysis as mda
-import logging
-logging.getLogger("MDAnalysis").setLevel(logging.ERROR)
+warnings.filterwarnings("ignore")
 
 import numpy as np
 import hdbscan
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+
 
 def plot_landscape(pc_x, pc_y, labels, unique_clusters, xlabel, ylabel, out_prefix):
     cmap = plt.get_cmap('turbo')
 
-    # ---------- PNG version ----------
+    # ---------- PNG ----------
     plt.figure(figsize=(10, 8))
     plt.scatter(pc_x, pc_y, color='lightgrey', s=1, alpha=0.5, label='Background / Noise')
 
@@ -47,7 +46,7 @@ def plot_landscape(pc_x, pc_y, labels, unique_clusters, xlabel, ylabel, out_pref
     plt.savefig(f"{out_prefix}.png", dpi=600, bbox_inches='tight')
     plt.close() # Closes the PNG before starting the PS
 
-    # ---------- PS version ----------
+    # ---------- PS ----------
     plt.figure(figsize=(10, 8))
     plt.scatter(pc_x, pc_y, color='lightgrey', s=1, label='Background / Noise')
 
@@ -93,7 +92,7 @@ def generate_fes_map(pc_x, pc_y, labels, unique_clusters, results_dir):
     # Topographic Lines
     ax.contour(X, Y, free_energy, levels=levels, colors='black', alpha=0.1, linewidths=0.5)
 
-    # Calculate and Add State Labels at the cluster centers
+    # Calculate and Add Cluster Labels at the cluster centers
     for cid in unique_clusters:
         mask = (labels == cid)
         cx, cy = np.mean(pc_x[mask]), np.mean(pc_y[mask])
@@ -116,9 +115,10 @@ def generate_fes_map(pc_x, pc_y, labels, unique_clusters, results_dir):
 def main():
 
     parser = argparse.ArgumentParser(description="Run HDBSCAN on CARMA PCA output.")
-    parser.add_argument('--size', type=int, default=1000, help='Minimum cluster size (Default: 1000)')
+    parser.add_argument('--size', type=int, default=500, help='Minimum cluster size (Default: 500)')
     parser.add_argument('--samples', type=int, default=50, help='Minimum samples (Default: 50)')
     parser.add_argument('--method', type=str, default='eom', choices=['eom', 'leaf'], help='Selection method (Default: eom)')
+    parser.add_argument('--dim', type=int, default=0, help='Number of PCs to use (0 = All)')
     args = parser.parse_args()
     print("=== HDBSCAN Clustering ===")
 
@@ -151,6 +151,12 @@ def main():
         
     frames = raw_data[:, 0].astype(int)
     data_nd = raw_data[:, 1:] 
+    
+    # --- DIMENSION SLICING ---
+    if args.dim > 0 and args.dim < data_nd.shape[1]:
+        data_nd = data_nd[:, :args.dim]
+        print(f"[*] Restricting clustering and medoids to the first {args.dim} Dimensions.")
+        
     total_frames, n_dimensions = data_nd.shape
     print(f"[+] Successfully loaded {total_frames:,} frames ({n_dimensions}D).")
 
@@ -170,13 +176,70 @@ def main():
     unique_clusters = np.unique(labels[labels != -1])
     print(f"[+] Found {len(unique_clusters)} distinct clusters in {elapsed:.2f} seconds.")
 
+    # --- SORTING ---
+    print("[*] Reordering cluster IDs by population size...")
+    
+    # 1. Count the population of each original cluster ID
+    cluster_counts = {cid: np.sum(labels == cid) for cid in unique_clusters}
+    
+    # 2. Sort the old IDs based on their counts (Largest to Smallest)
+    sorted_old_cids = sorted(cluster_counts, key=cluster_counts.get, reverse=True)
+    
+    # 3. Create a mapping dictionary: {old_id: new_id}
+    # Noise (-1) stays -1. The largest old_id becomes 0, the next becomes 1, etc.
+    id_mapping = {-1: -1}
+    for new_id, old_id in enumerate(sorted_old_cids):
+        id_mapping[old_id] = new_id
+        
+    # 4. Apply the mapping to the entire labels array
+    reordered_labels = np.copy(labels)
+    for old_id, new_id in id_mapping.items():
+        if old_id != -1:
+            reordered_labels[labels == old_id] = new_id
+            
+    # Overwrite the labels array and update unique_clusters
+    labels = reordered_labels
+    unique_clusters = np.unique(labels[labels != -1])
+    # ----------------------------------------------------
     # Populations
     noise_frames = np.sum(labels == -1)
     print("\n    Populations:")
     for cid in unique_clusters:
         count = np.sum(labels == cid)
         print(f"      Cluster {cid:2d}: {count:7d} frames ({(count / total_frames) * 100:5.1f}%)")
-    print(f"      Noise   : {noise_frames:7d} frames ({(noise_frames / total_frames) * 100:5.1f}%)")
+    print(f"      Noise    : {noise_frames:7d} frames ({(noise_frames / total_frames) * 100:5.1f}%)")
+
+    # --- AUTOMATED REPORT GENERATION ---
+    print("\n[*] Generating Run Report...")
+    report_filename = os.path.join(results_dir, "pipeline_report.txt")
+    
+    with open(report_filename, "w") as report:
+        report.write("==================================================\n")
+        report.write("RUN REPORT\n")
+        report.write("==================================================\n\n")
+        
+        report.write("--- INPUT PARAMETERS ---\n")
+        report.write(f"Total Frames Analyzed : {total_frames:,}\n")
+        report.write(f"Dimensions Used       : {n_dimensions}\n")
+        report.write(f"Min Cluster Size      : {args.size}\n")
+        report.write(f"Min Sample Size       : {args.samples}\n")
+        report.write(f"Selection Method      : {args.method}\n\n")
+        
+        report.write("--- COMPUTATIONAL EFFICIENCY ---\n")
+        report.write(f"HDBSCAN Execution Time: {elapsed:.2f} seconds\n\n")
+        
+        report.write("--- POPULATIONS ---\n")
+        report.write(f"Total clusters found : {len(unique_clusters)}\n")
+        for cid in unique_clusters:
+            count = np.sum(labels == cid)
+            percentage = (count / total_frames) * 100
+            report.write(f"  Cluster {cid:2d} : {count:7d} frames ({percentage:5.1f}%)\n")
+        
+        noise_percentage = (noise_frames / total_frames) * 100
+        report.write(f"  Noise    : {noise_frames:7d} frames ({noise_percentage:5.1f}%)\n")
+        report.write("==================================================\n")
+        
+    print(f"[+] Report saved to: {report_filename}")
 
     # Export Data
     out_filename = os.path.join(results_dir, f"hdbscan.{n_dimensions}-D.clusters.dat")
@@ -225,37 +288,64 @@ def main():
             print(f"      -> Medoid identified at frame {medoid_frame}")
 
             # --- SUBPROCESS EXTRACTIONS ---
-            # Step 1: Extract the full cluster DCD (for superposition)
+            # Step 1: Extract the full cluster DCD
             frame_list_file = f"temp_frames_cluster_{cid}.dat"
             np.savetxt(frame_list_file, cluster_frames, fmt='%d')
-            subprocess.run(["carma", "-v", "-sort", frame_list_file, original_dcd], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            
+            # Run CARMA
+            subprocess.run(["carma", "-v", "-sort", frame_list_file, original_dcd])
             
             final_dcd_name = os.path.join(results_dir, f"cluster_{cid}.dcd")
             if os.path.exists("carma.reordered.dcd"):
                 os.rename("carma.reordered.dcd", final_dcd_name)
 
-            # Step 2: Generate Superposition PDB (from the DCD) using CARMA
-            subprocess.run(["carma", "-v", "-w", "-cov", "-dot", "-super", "-atmid", "ALLID", final_dcd_name, original_psf], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # Step 2: Generate Superposition PDB using the full backbone
+            carma_cmd = [
+                "carma", "-v", "-w", "-cov", "-dot", "-super", 
+                "-atomid", "CA", "-atomid", "C", "-atomid", "N", "-atomid", "O", 
+                final_dcd_name, original_psf
+            ]
+            
+            # Run CARMA
+            result = subprocess.run(carma_cmd, capture_output=True, text=True)
+            
             if os.path.exists("carma.superposition.pdb"):
                 os.rename("carma.superposition.pdb", os.path.join(results_dir, f"cluster_{cid}_superposition.pdb"))
+            else:
+                print(f"      [!] CARMA Superposition failed for cluster {cid}.")
+                print(f"          --- CARMA ERROR LOG ---")
+                print(f"          STDOUT: {result.stdout.strip()}")
+                print(f"          STDERR: {result.stderr.strip()}")
+                print(f"          -----------------------")
                 
+            # Cleanup intermediate average
             if os.path.exists("carma.average.pdb"):
                 os.remove("carma.average.pdb")
 
-            # Step 3: Extract the Medoid PDB using MDAnalysis
-            try:
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    
-                    # MDAnalysis reads trajectories as 0-indexed
-                    u = mda.Universe(original_psf, original_dcd)
-                    target_frame = int(medoid_frame) - 1 if int(medoid_frame) > 0 else 0 
-                    
-                    u.trajectory[target_frame] 
-                    medoid_out_path = os.path.join(results_dir, f"cluster_{cid}_medoid.pdb")
-                    u.atoms.write(medoid_out_path)
-            except Exception as e:
-                print(f"      [!] Error extracting Medoid for State {cid}: {e}")
+            # Step 3: Extract the Medoid PDB using CARMA
+            carma_medoid_cmd = [
+                "carma", "-v", 
+                "-first", str(medoid_frame), 
+                "-last", str(medoid_frame), 
+                "-pdb", original_dcd, original_psf
+            ]
+            
+            # Run CARMA 
+            result_medoid = subprocess.run(carma_medoid_cmd, capture_output=True, text=True)
+            
+            extracted_pdbs = [f for f in glob.glob("*.pdb") if "superposition" not in f and "average" not in f and "cluster_" not in f]
+            
+            if extracted_pdbs:
+                # Rename the first matched PDB and delete any extras
+                os.rename(extracted_pdbs[0], os.path.join(results_dir, f"cluster_{cid}_medoid.pdb"))
+                for extra_pdb in extracted_pdbs[1:]:
+                    os.remove(extra_pdb)
+            else:
+                print(f"      [!] CARMA Medoid extraction failed for cluster {cid}.")
+                print(f"          --- CARMA MEDOID ERROR LOG ---")
+                print(f"          STDOUT: {result_medoid.stdout.strip()}")
+                print(f"          STDERR: {result_medoid.stderr.strip()}")
+                print(f"          ------------------------------")
 
             # Cleanup
             for f in glob.glob("*varcov*") + glob.glob("carma.*") + [frame_list_file]:
@@ -263,6 +353,7 @@ def main():
                     os.remove(f)
                 except OSError: 
                     pass
+                    
         print("\n[+] CARMA extraction complete. DCDs, Superpositions, and Medoids saved.")
 
     print(f"\n=== Complete. All files saved to {results_dir}/ ===")
