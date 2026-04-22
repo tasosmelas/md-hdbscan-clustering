@@ -15,7 +15,7 @@ Before running this pipeline, ensure your system has the following installed:
 ## Repository Structure
 * `scripts/`: Contains the executable Python tools (`cluster`).
 * `setup_env.sh`: Automated environment installer and dependency manager.
-* `requirements.txt`: Python package dependencies (NumPy, HDBSCAN, Matplotlib, MDAnalysis).
+* `requirements.txt`: Python package dependencies (NumPy, HDBSCAN, Matplotlib).
 
 ## Installation
 To set up the environment and install all dependencies on a new machine, simply run the Bash setup script from the root of the repository:
