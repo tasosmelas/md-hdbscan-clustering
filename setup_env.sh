@@ -22,14 +22,26 @@ SCRIPTS_DIR=$(realpath ./scripts)
 echo "[*] Making scripts executable..."
 chmod +x "$SCRIPTS_DIR"/*
 
-# 3. Install dependencies
-echo "[*] Ensuring all Python dependencies are installed..."
-pip3 install --user -r requirements.txt --break-system-packages
+# 3. Create an isolated virtual environment
+ENV_NAME="thesis_env"
+if [ ! -d "$ENV_NAME" ]; then
+    echo "[*] Creating isolated Python environment: $ENV_NAME..."
+    python3 -m venv $ENV_NAME
+else
+    echo "[*] Environment '$ENV_NAME' already exists. Updating..."
+fi
+
+# 4. Activate and install dependencies
+echo "[*] Installing dependencies..."
+source $ENV_NAME/bin/activate
+pip install --upgrade pip --quiet
+pip install -r requirements.txt --quiet
 
 echo "-------------------------------------------------------"
 echo "[+] SETUP COMPLETE!"
-echo "[+] To run the tools from anywhere, run this command once,"
-echo "[+] or add it to your ~/.bashrc file:"
+echo "[+] Step 1: Activate the environment before running anything:"
+echo "    source $ENV_NAME/bin/activate"
 echo ""
-echo "export PATH=\"$SCRIPTS_DIR:\$PATH\""
+echo "[+] Step 2: Add scripts to your PATH for this session:"
+echo "    export PATH=\"$SCRIPTS_DIR:\$PATH\""
 echo "-------------------------------------------------------"
