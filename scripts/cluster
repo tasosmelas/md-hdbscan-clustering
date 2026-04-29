@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """
-Automating the multidimensional clustering of data derived from a
-Principal Component Analysis of molecular dynamics trajectories using
-HDBSCAN.
+Automating the multidimensional clustering of data derived from a Principal Component Analysis of molecular dynamics trajectories using HDBSCAN.
 """
 
 import os
@@ -13,21 +11,96 @@ import datetime
 import argparse
 import subprocess
 import warnings
-
-os.environ['PYTHONWARNINGS'] = 'ignore'
-warnings.filterwarnings("ignore")
-
+import psutil
+import logging
 import numpy as np
 import hdbscan
 import matplotlib
-matplotlib.use('Agg')
+matplotlib.use('Agg') # Suppress interactive display for server-side rendering
 import matplotlib.pyplot as plt
 
+warnings.filterwarnings("ignore")
+
+def run_and_log_carma(cmd_list):
+    """
+    Executes external CARMA C-binary commands securely via subprocess.
+    Captures standard output and standard error streams to maintain a 
+    continuous, verifiable audit trail in the master execution log.
+    """
+    result = subprocess.run(cmd_list, capture_output=True, text=True)
+    if result.stdout:
+        for line in result.stdout.splitlines():
+            logging.getLogger().handlers[0].stream.write(line + "\n")
+    if result.stderr:
+        for line in result.stderr.splitlines():
+            logging.getLogger().handlers[0].stream.write("ERROR: " + line + "\n")
+    return result.stdout
+
+def parse_carma_log_for_atoms():
+    """
+    Automatically deduces the atom selection (e.g., CA, C, N, O) used during 
+    the initial PCA by parsing previous CARMA execution logs. Ensures absolute 
+    topological consistency between the PCA projection and subsequent RMSD calculations.
+    """
+    log_files = glob.glob('carma_results_*/last_carma_run.log')
+    fallback_flags = ["-atomid", "CA", "-atomid", "C", "-atomid", "N", "-atomid", "O"]
+    
+    if not log_files:
+        return fallback_flags
+        
+    try:
+        with open(log_files[0], 'r') as f:
+            for line in f:
+                if "atoms are declared in the PSF file" in line:
+                    parts = line.split()
+                    atoms_idx = parts.index("atoms")
+                    atom_names = parts[1:atoms_idx]
+                    
+                    flags = []
+                    for atom in atom_names:
+                        flags.extend(["-atomid", atom])
+                        
+                    logging.info(f"[*] Detected PCA atoms from log: {', '.join(atom_names)}")
+                    return flags
+    except Exception as e:
+        logging.warning(f"[-] Error parsing atom IDs, using default backbone. ({e})")
+        
+    return fallback_flags
+
+def calculate_variance_explained(dim_used):
+    """
+    Calculates the percentage of total structural variance captured by the 
+    selected Principal Components, based on the eigenvalues of the covariance matrix.
+    """
+    eig_files = glob.glob('*eigenvalues.dat')
+    if not eig_files:
+        eig_files = glob.glob('carma_results_*/*eigenvalues.dat')
+        
+    if not eig_files:
+        return "N/A"
+        
+    try:
+        eigenvalues = np.loadtxt(eig_files[0])
+        total_variance = np.sum(eigenvalues)
+        
+        if dim_used == 0 or dim_used >= len(eigenvalues):
+            return "100.0%"
+            
+        used_variance = np.sum(eigenvalues[:dim_used])
+        percentage = (used_variance / total_variance) * 100
+        return f"{percentage:.1f}%"
+        
+    except Exception as e:
+        logging.warning(f"[-] Could not calculate variance: {e}")
+        return "Error"
 
 def plot_landscape(pc_x, pc_y, labels, unique_clusters, xlabel, ylabel, out_prefix):
+    """
+    Generates 2D scatter projections of the conformational space.
+    Clusters are color-coded, while transition states (Noise: -1) are rendered in grey.
+    """
     cmap = plt.get_cmap('turbo')
 
-    # ---------- PNG ----------
     plt.figure(figsize=(10, 8))
     plt.scatter(pc_x, pc_y, color='lightgrey', s=1, alpha=0.5, label='Background / Noise')
 
@@ -44,15 +117,15 @@ def plot_landscape(pc_x, pc_y, labels, unique_clusters, xlabel, ylabel, out_pref
         plt.legend(markerscale=5, loc='center left', bbox_to_anchor=(1, 0.5))
     
     plt.savefig(f"{out_prefix}.png", dpi=600, bbox_inches='tight')
-    plt.close() # Closes the PNG before starting the PS
+    plt.close() 
 
-    # ---------- PS ----------
+    # Generate high-resolution PostScript version for publication
     plt.figure(figsize=(10, 8))
     plt.scatter(pc_x, pc_y, color='lightgrey', s=1, label='Background / Noise')
 
     for i, cid in enumerate(unique_clusters):
         mask = (labels == cid)
-        cluster_color = cmap(i / max(1, (len(unique_clusters) - 1)))[:3] # Drop Alpha for PS
+        cluster_color = cmap(i / max(1, (len(unique_clusters) - 1)))[:3] 
         plt.scatter(pc_x[mask], pc_y[mask], color=cluster_color, s=2, label=f'Cluster {cid}')
 
     plt.title(f'Plot: {xlabel} vs {ylabel}')
@@ -66,33 +139,31 @@ def plot_landscape(pc_x, pc_y, labels, unique_clusters, xlabel, ylabel, out_pref
     plt.close()
 
 def generate_fes_map(pc_x, pc_y, labels, unique_clusters, results_dir):
-    """Generates a Boltzmann-inverted Free Energy Surface map."""
-    print("[*] Calculating Topographic Free Energy Surface (FES)...")
+    """
+    Converts 2D Principal Component histograms into a Topographic Free Energy 
+    Surface (FES) represented in k_B T units. Maps cluster centroids directly 
+    onto the corresponding thermodynamic basins.
+    """
+    logging.info("[*] Calculating Topographic Free Energy Surface (FES)...")
     
-    # Calculate 2D Histogram
     bins = 100
     hist, xedges, yedges = np.histogram2d(pc_x, pc_y, bins=bins)
     
-    # Boltzmann Inversion: F = -ln(P/Pmax)
+    # Calculate free energy: F = -kT * ln(P/P_max)
     max_pop = np.max(hist)
-    # We use a small epsilon to avoid log(0)
     free_energy = -np.log((hist.T + 1e-10) / max_pop)
-    free_energy[free_energy > 6] = 6.0 # Cap the display at 6 kT for clarity
+    free_energy[free_energy > 6] = 6.0 
     
     x_centers = (xedges[:-1] + xedges[1:]) / 2
     y_centers = (yedges[:-1] + yedges[1:]) / 2
     X, Y = np.meshgrid(x_centers, y_centers)
 
     fig, ax = plt.subplots(figsize=(12, 10))
-    
-    # Background
     levels = np.linspace(0, 6, 13)
     contour = ax.contourf(X, Y, free_energy, levels=levels, cmap='turbo_r', extend='max')
-    
-    # Topographic Lines
     ax.contour(X, Y, free_energy, levels=levels, colors='black', alpha=0.1, linewidths=0.5)
 
-    # Calculate and Add Cluster Labels at the cluster centers
+    # Overlay cluster IDs at their respective coordinate centroids
     for cid in unique_clusters:
         mask = (labels == cid)
         cx, cy = np.mean(pc_x[mask]), np.mean(pc_y[mask])
@@ -102,261 +173,311 @@ def generate_fes_map(pc_x, pc_y, labels, unique_clusters, results_dir):
 
     cbar = fig.colorbar(contour)
     cbar.set_label('Free Energy ($k_B T$)', fontsize=12, fontweight='bold')
-
     ax.set_title('Free Energy Landscape (PC1 vs PC2)', fontsize=16, fontweight='bold')
     ax.set_xlabel('Principal Component 1')
     ax.set_ylabel('Principal Component 2')
     
-    out_path = os.path.join(results_dir, "FES_Landscape_PC1_vs_PC2.png")
-    plt.savefig(out_path, dpi=600, bbox_inches='tight')
+    out_path_2d = os.path.join(results_dir, "FES_Landscape_2D_PC1_vs_PC2.png")
+    plt.savefig(out_path_2d, dpi=600, bbox_inches='tight')
     plt.close()
-    print(f"[+] FES Map saved to {out_path}")
+    logging.info(f"[+] FES Map saved to {out_path_2d}")
 
 def main():
+    pipeline_start = time.time()
+    process = psutil.Process(os.getpid())
+    timing_stats = {'load': 0, 'hdbscan': 0, 'export': 0, 'plots': 0, 'extract': 0}
+    carma_stats = {'sort': 0, 'rmsd': 0, 'super': 0}
+    cluster_rmsds = {}
 
+    # --- CLI Argument Parsing ---
     parser = argparse.ArgumentParser(description="Run HDBSCAN on CARMA PCA output.")
-    parser.add_argument('--size', type=int, default=500, help='Minimum cluster size (Default: 500)')
-    parser.add_argument('--samples', type=int, default=50, help='Minimum samples (Default: 50)')
+    parser.add_argument('--fraction', type=float, default=0.05, help='Percentage of total frames required to form a cluster (Default: 0.05%%)')
     parser.add_argument('--method', type=str, default='eom', choices=['eom', 'leaf'], help='Selection method (Default: eom)')
     parser.add_argument('--dim', type=int, default=0, help='Number of PCs to use (0 = All)')
     args = parser.parse_args()
-    print("=== HDBSCAN Clustering ===")
 
-    print("[*] Locating fluctuations file...")
+    # --- Directory & Logger Initialization ---
+    timestamp = datetime.datetime.now().strftime("%d.%m.%Y_%H.%M.%S")
+    results_dir = f"cluster_results_{timestamp}"
+    os.makedirs(results_dir, exist_ok=True)
+
+    log_file_path = os.path.join(results_dir, "clustering_execution.log")
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(message)s',
+        handlers=[
+            logging.FileHandler(log_file_path),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+
+    logging.info("=== HDBSCAN Clustering ===")
+    logging.info(f"[+] Created output directory: {results_dir}")
     
+    # --- Data Ingestion ---
+    logging.info("[*] Locating fluctuations file...")
     fluctuation_files = glob.glob('*fluctuations.dat')
-    
     if not fluctuation_files:
         fluctuation_files = glob.glob('carma_results_*/*fluctuations.dat')
         
     if not fluctuation_files:
-        print("[-] Error: '*fluctuations.dat' not found.")
+        logging.error("[-] Error: '*fluctuations.dat' not found.")
         sys.exit(1)
 
     data_file = fluctuation_files[0]
-    print(f"[+] Found: {data_file}")
-
-    # Creating output directory
-    timestamp = datetime.datetime.now().strftime("%d.%m.%Y_%H.%M.%S")
-    results_dir = f"cluster_results_{timestamp}"
-    os.makedirs(results_dir, exist_ok=True)
-    print(f"[+] Created output directory: {results_dir}")
+    logging.info(f"[+] Found: {data_file}")
     
-    print("[*] Loading data into memory...")
+    logging.info("[*] Loading data into memory...")
+    t0 = time.time()
     try:
         raw_data = np.loadtxt(data_file)
     except Exception as e:
-        print(f"[-] Error loading data: {e}")
+        logging.error(f"[-] Error loading data: {e}")
         sys.exit(1)
         
     frames = raw_data[:, 0].astype(int)
     data_nd = raw_data[:, 1:] 
     
-    # --- DIMENSION SLICING ---
+    # Restrict dimensionality if requested
     if args.dim > 0 and args.dim < data_nd.shape[1]:
         data_nd = data_nd[:, :args.dim]
-        print(f"[*] Restricting clustering and medoids to the first {args.dim} Dimensions.")
+        logging.info(f"[*] Restricting clustering to first {args.dim} Dimensions.")
         
     total_frames, n_dimensions = data_nd.shape
-    print(f"[+] Successfully loaded {total_frames:,} frames ({n_dimensions}D).")
+    timing_stats['load'] = time.time() - t0
+    logging.info(f"[+] Successfully loaded {total_frames:,} frames ({n_dimensions}D).")
 
-    # HDBSCAN Execution
-    print(f"\n[*] Running HDBSCAN (Size: {args.size}, Samples: {args.samples}, Method: {args.method})...")
-    start_time = time.time()
-    
+    # --- Dynamic Threshold Scaling ---
+    # Scale density requirements based on the total trajectory length
+    dynamic_size = int(total_frames * (args.fraction / 100.0))
+    dynamic_samples = int(dynamic_size / 10.0)
+    dynamic_size = max(10, dynamic_size)
+    dynamic_samples = max(2, dynamic_samples)
+
+    logging.info(f"\n[*] Dynamic Scale Thresholds ({args.fraction}%):")
+    logging.info(f"    -> Min Cluster Size: {dynamic_size} frames")
+    logging.info(f"    -> Min Samples:      {dynamic_samples} frames")
+
+    # --- HDBSCAN Execution ---
+    logging.info(f"\n[*] Running HDBSCAN (Method: {args.method})...")
+    t0 = time.time()
     clusterer = hdbscan.HDBSCAN(
-        min_cluster_size=args.size,
-        min_samples=args.samples,
+        min_cluster_size=dynamic_size,
+        min_samples=dynamic_samples,
         cluster_selection_method=args.method,
-        core_dist_n_jobs=-1
+        core_dist_n_jobs=-1 # Utilize all available CPU cores for KD-Tree construction
     )
     labels = clusterer.fit_predict(data_nd)
-    elapsed = time.time() - start_time
+    timing_stats['hdbscan'] = time.time() - t0
 
     unique_clusters = np.unique(labels[labels != -1])
-    print(f"[+] Found {len(unique_clusters)} distinct clusters in {elapsed:.2f} seconds.")
+    logging.info(f"[+] Found {len(unique_clusters)} distinct clusters in {timing_stats['hdbscan']:.2f} seconds.")
 
-    # --- SORTING ---
-    print("[*] Reordering cluster IDs by population size...")
-    
-    # 1. Count the population of each original cluster ID
+    # --- Cluster Reordering ---
+    # Sort cluster IDs mathematically ensuring Cluster 0 is always the global minimum basin
+    logging.info("[*] Reordering cluster IDs by population size...")
     cluster_counts = {cid: np.sum(labels == cid) for cid in unique_clusters}
-    
-    # 2. Sort the old IDs based on their counts (Largest to Smallest)
     sorted_old_cids = sorted(cluster_counts, key=cluster_counts.get, reverse=True)
     
-    # 3. Create a mapping dictionary: {old_id: new_id}
-    # Noise (-1) stays -1. The largest old_id becomes 0, the next becomes 1, etc.
     id_mapping = {-1: -1}
     for new_id, old_id in enumerate(sorted_old_cids):
         id_mapping[old_id] = new_id
         
-    # 4. Apply the mapping to the entire labels array
     reordered_labels = np.copy(labels)
     for old_id, new_id in id_mapping.items():
         if old_id != -1:
             reordered_labels[labels == old_id] = new_id
             
-    # Overwrite the labels array and update unique_clusters
     labels = reordered_labels
     unique_clusters = np.unique(labels[labels != -1])
-    # ----------------------------------------------------
-    # Populations
+
     noise_frames = np.sum(labels == -1)
-    print("\n    Populations:")
+    logging.info("\n    Populations:")
     for cid in unique_clusters:
         count = np.sum(labels == cid)
-        print(f"      Cluster {cid:2d}: {count:7d} frames ({(count / total_frames) * 100:5.1f}%)")
-    print(f"      Noise    : {noise_frames:7d} frames ({(noise_frames / total_frames) * 100:5.1f}%)")
+        logging.info(f"      Cluster {cid:2d}: {count:7d} frames ({(count / total_frames) * 100:5.1f}%)")
+    logging.info(f"      Noise    : {noise_frames:7d} frames ({(noise_frames / total_frames) * 100:5.1f}%)")
 
-    # --- AUTOMATED REPORT GENERATION ---
-    print("\n[*] Generating Run Report...")
-    report_filename = os.path.join(results_dir, "pipeline_report.txt")
-    
-    with open(report_filename, "w") as report:
-        report.write("==================================================\n")
-        report.write("RUN REPORT\n")
-        report.write("==================================================\n\n")
-        
-        report.write("--- INPUT PARAMETERS ---\n")
-        report.write(f"Total Frames Analyzed : {total_frames:,}\n")
-        report.write(f"Dimensions Used       : {n_dimensions}\n")
-        report.write(f"Min Cluster Size      : {args.size}\n")
-        report.write(f"Min Sample Size       : {args.samples}\n")
-        report.write(f"Selection Method      : {args.method}\n\n")
-        
-        report.write("--- COMPUTATIONAL EFFICIENCY ---\n")
-        report.write(f"HDBSCAN Execution Time: {elapsed:.2f} seconds\n\n")
-        
-        report.write("--- POPULATIONS ---\n")
-        report.write(f"Total clusters found : {len(unique_clusters)}\n")
-        for cid in unique_clusters:
-            count = np.sum(labels == cid)
-            percentage = (count / total_frames) * 100
-            report.write(f"  Cluster {cid:2d} : {count:7d} frames ({percentage:5.1f}%)\n")
-        
-        noise_percentage = (noise_frames / total_frames) * 100
-        report.write(f"  Noise    : {noise_frames:7d} frames ({noise_percentage:5.1f}%)\n")
-        report.write("==================================================\n")
-        
-    print(f"[+] Report saved to: {report_filename}")
-
-    # Export Data
+    # --- Data Export ---
+    t0 = time.time()
     out_filename = os.path.join(results_dir, f"hdbscan.{n_dimensions}-D.clusters.dat")
-    print(f"\n[*] Exporting coordinate data to {out_filename}...")
+    logging.info(f"\n[*] Exporting coordinate data to {out_filename}...")
     out_data = np.column_stack((frames, labels, data_nd))
     fmt_string = f"%10d %4d " + ' '.join(['%11.7f'] * n_dimensions)
     np.savetxt(out_filename, out_data, fmt=fmt_string)
+    timing_stats['export'] = time.time() - t0
 
-    # Plotting
-    print("[*] Generating Plots (PNG & PS)...")
+    # --- Visualization ---
+    logging.info("[*] Generating Plots...")
+    t0 = time.time()
     if n_dimensions >= 2:
-        # 1. Standard Scatter Plot
         plot_landscape(data_nd[:, 0], data_nd[:, 1], labels, unique_clusters, "PC1", "PC2", os.path.join(results_dir, "landscape_PC1_vs_PC2"))
-        
-        # 2. Free Energy Map
         generate_fes_map(data_nd[:, 0], data_nd[:, 1], labels, unique_clusters, results_dir)
         
         if n_dimensions >= 3:
             plot_landscape(data_nd[:, 0], data_nd[:, 2], labels, unique_clusters, "PC1", "PC3", os.path.join(results_dir, "landscape_PC1_vs_PC3"))
             plot_landscape(data_nd[:, 1], data_nd[:, 2], labels, unique_clusters, "PC2", "PC3", os.path.join(results_dir, "landscape_PC2_vs_PC3"))
+            
+    timing_stats['plots'] = time.time() - t0
 
-    # --- AUTOMATED CARMA EXTRACTION (SUPERPOSITION) ---
-    print("\n[*] Starting automated CARMA Structural Extraction...")
-    dcd_files = [f for f in glob.glob('*.dcd') if not f.startswith(('carma', 'cluster'))]
-    psf_files = [f for f in glob.glob('*.psf') if not f.startswith('carma')]
+    # --- Automated Structural Extraction (CARMA Interface) ---
+    logging.info("\n[*] Starting automated CARMA Structural Extraction...")
+    t0_extract = time.time()
+    
+    atom_flags = parse_carma_log_for_atoms()
+    variance_str = calculate_variance_explained(args.dim)
+    
+    # Locate original topology and trajectory binaries
+    dcd_files = [f for f in os.listdir('.') if f.endswith('.dcd') and not f.startswith(('carma', 'cluster', 'transitions', 'dPCA'))]
+    psf_files = [f for f in os.listdir('.') if f.endswith('.psf') and not f.startswith(('carma', 'cluster', 'transitions', 'dPCA'))]
     
     if not dcd_files or not psf_files:
-        print("[-] Missing original .dcd or .psf file. Skipping extraction.")
+        logging.warning("[-] Missing original .dcd or .psf file. Skipping extraction.")
     else:
         original_dcd = dcd_files[0]
         original_psf = psf_files[0]
-        print(f"[+] Found trajectory: {original_dcd}")
-        print(f"[+] Found topology: {original_psf}")
+        logging.info(f"[+] Found trajectory: {original_dcd}")
+        logging.info(f"[+] Found topology: {original_psf}")
         
+        # Sequentially process and extract each identified micro-state
         for cid in unique_clusters:
-            print(f"    -> Processing Cluster {cid}...")
+            logging.info(f"    -> Processing Cluster {cid}...")
             
             cluster_mask = (labels == cid)
             cluster_frames = frames[cluster_mask]
             cluster_coords = data_nd[cluster_mask]
             
-            # --- MEDOID EXTRACTION ---
+            # Calculate the mathematical Medoid (frame closest to the cluster centroid)
             centroid = np.mean(cluster_coords, axis=0)
             distances = np.linalg.norm(cluster_coords - centroid, axis=1)
             medoid_frame = cluster_frames[np.argmin(distances)]
-            print(f"      -> Medoid identified at frame {medoid_frame}")
-
-            # --- SUBPROCESS EXTRACTIONS ---
-            # Step 1: Extract the full cluster DCD
+            
             frame_list_file = f"temp_frames_cluster_{cid}.dat"
             np.savetxt(frame_list_file, cluster_frames, fmt='%d')
             
-            # Run CARMA
-            subprocess.run(["carma", "-v", "-sort", frame_list_file, original_dcd])
+            # Step 1: DCD Extraction
+            t_sub = time.time()
+            run_and_log_carma(["carma", "-v", "-sort", frame_list_file, original_dcd])
+            carma_stats['sort'] += (time.time() - t_sub)
             
             final_dcd_name = os.path.join(results_dir, f"cluster_{cid}.dcd")
             if os.path.exists("carma.reordered.dcd"):
                 os.rename("carma.reordered.dcd", final_dcd_name)
 
-            # Step 2: Generate Superposition PDB using the full backbone
-            carma_cmd = [
-                "carma", "-v", "-w", "-cov", "-dot", "-super", 
-                "-atomid", "CA", "-atomid", "C", "-atomid", "N", "-atomid", "O", 
-                final_dcd_name, original_psf
-            ]
+            # Step 2: RMSD Variance Calculation
+            t_sub = time.time()
+            rmsd_cmd = ["carma", "-v", "-rms"] + atom_flags + [final_dcd_name, original_psf]
+            rmsd_output = run_and_log_carma(rmsd_cmd)
+            carma_stats['rmsd'] += (time.time() - t_sub)
             
-            # Run CARMA
-            result = subprocess.run(carma_cmd, capture_output=True, text=True)
+            cluster_rmsds[cid] = -1.0
+            for line in rmsd_output.splitlines():
+                if "Maximum rms deviation from average distances is" in line:
+                    try:
+                        cluster_rmsds[cid] = float(line.split()[-1])
+                    except ValueError:
+                        pass
+
+            # Step 3: Structural Superpositioning
+            t_sub = time.time()
+            carma_cmd = ["carma", "-v", "-w", "-cov", "-dot", "-super"] + atom_flags + [final_dcd_name, original_psf]
+            run_and_log_carma(carma_cmd)
+            carma_stats['super'] += (time.time() - t_sub)
             
             if os.path.exists("carma.superposition.pdb"):
                 os.rename("carma.superposition.pdb", os.path.join(results_dir, f"cluster_{cid}_superposition.pdb"))
-            else:
-                print(f"      [!] CARMA Superposition failed for cluster {cid}.")
-                print(f"          --- CARMA ERROR LOG ---")
-                print(f"          STDOUT: {result.stdout.strip()}")
-                print(f"          STDERR: {result.stderr.strip()}")
-                print(f"          -----------------------")
                 
-            # Cleanup intermediate average
             if os.path.exists("carma.average.pdb"):
                 os.remove("carma.average.pdb")
 
-            # Step 3: Extract the Medoid PDB using CARMA
-            carma_medoid_cmd = [
-                "carma", "-v", 
-                "-first", str(medoid_frame), 
-                "-last", str(medoid_frame), 
-                "-pdb", original_dcd, original_psf
-            ]
-            
-            # Run CARMA 
-            result_medoid = subprocess.run(carma_medoid_cmd, capture_output=True, text=True)
+            # Step 4: Medoid PDB Export
+            t_sub = time.time()
+            carma_medoid_cmd = ["carma", "-v", "-first", str(medoid_frame), "-last", str(medoid_frame), "-pdb", original_dcd, original_psf]
+            run_and_log_carma(carma_medoid_cmd)
+            carma_stats['sort'] += (time.time() - t_sub)
             
             extracted_pdbs = [f for f in glob.glob("*.pdb") if "superposition" not in f and "average" not in f and "cluster_" not in f]
-            
             if extracted_pdbs:
-                # Rename the first matched PDB and delete any extras
                 os.rename(extracted_pdbs[0], os.path.join(results_dir, f"cluster_{cid}_medoid.pdb"))
                 for extra_pdb in extracted_pdbs[1:]:
                     os.remove(extra_pdb)
-            else:
-                print(f"      [!] CARMA Medoid extraction failed for cluster {cid}.")
-                print(f"          --- CARMA MEDOID ERROR LOG ---")
-                print(f"          STDOUT: {result_medoid.stdout.strip()}")
-                print(f"          STDERR: {result_medoid.stderr.strip()}")
-                print(f"          ------------------------------")
 
-            # Cleanup
-            for f in glob.glob("*varcov*") + glob.glob("carma.*") + [frame_list_file]:
-                try: 
-                    os.remove(f)
-                except OSError: 
-                    pass
-                    
-        print("\n[+] CARMA extraction complete. DCDs, Superpositions, and Medoids saved.")
+            # Strict Temporary File Cleanup
+            for f in glob.glob("*varcov*") + glob.glob("carma.*") + glob.glob("*.rmsdev.ps") + glob.glob("*.averag.ps") + [frame_list_file]:
+                try: os.remove(f)
+                except OSError: pass
 
-    print(f"\n=== Complete. All files saved to {results_dir}/ ===")
+        # --- Transition Noise Handling ---
+        logging.info("    -> Extracting Transition Noise (-1)...")
+        noise_mask = (labels == -1)
+        if np.any(noise_mask):
+            noise_frames_array = frames[noise_mask]
+            noise_file = "temp_frames_noise.dat"
+            np.savetxt(noise_file, noise_frames_array, fmt='%d')
+            
+            t_sub = time.time()
+            run_and_log_carma(["carma", "-v", "-sort", noise_file, original_dcd])
+            carma_stats['sort'] += (time.time() - t_sub)
+            
+            if os.path.exists("carma.reordered.dcd"):
+                os.rename("carma.reordered.dcd", os.path.join(results_dir, "transitions_noise.dcd"))
+            try: os.remove(noise_file)
+            except OSError: pass
+
+        logging.info("\n[+] CARMA extraction complete. DCDs, Superpositions, and Medoids saved.")
+    timing_stats['extract'] = time.time() - t0_extract
+
+    # --- Profiling & Execution Report Generation ---
+    logging.info("\n[*] Generating Execution & Profiling Report...")
+    report_filename = os.path.join(results_dir, "pipeline_report.txt")
+    
+    total_pipeline_time = time.time() - pipeline_start
+    peak_ram_gb = process.memory_info().rss / (1024 ** 3) 
+    cpu_cores = psutil.cpu_count(logical=True)
+
+    with open(report_filename, "w") as report:
+        report.write("==================================================\n")
+        report.write("PIPELINE EXECUTION & RESOURCE REPORT\n")
+        report.write("==================================================\n\n")
+        
+        report.write("--- INPUT PARAMETERS ---\n")
+        report.write(f"Total Frames Analyzed : {total_frames:,}\n")
+        report.write(f"Dimensions Used       : {n_dimensions} (Capturing {variance_str} of variance)\n")
+        report.write(f"Density Threshold     : {args.fraction}%\n")
+        report.write(f"Calculated Min Size   : {dynamic_size}\n")
+        report.write(f"Calculated Min Samples: {dynamic_samples}\n")
+        report.write(f"Selection Method      : {args.method}\n\n")
+        
+        report.write("--- SYSTEM PROFILING & COMPUTATIONAL EFFICIENCY ---\n")
+        report.write(f"CPU Cores Detected    : {cpu_cores}\n")
+        report.write(f"Peak RAM Allocation   : {peak_ram_gb:.2f} GB\n")
+        report.write(f"Total Pipeline Time   : {total_pipeline_time:.2f} seconds\n\n")
+        
+        report.write("[ Execution Breakdown ]\n")
+        report.write(f"  Data Ingestion (I/O): {timing_stats.get('load', 0):7.2f} s\n")
+        report.write(f"  HDBSCAN Clustering  : {timing_stats.get('hdbscan', 0):7.2f} s\n")
+        report.write(f"  Cluster Data Export : {timing_stats.get('export', 0):7.2f} s\n")
+        report.write(f"  Visualization       : {timing_stats.get('plots', 0):7.2f} s\n")
+        report.write(f"  CARMA Clock Total   : {timing_stats.get('extract', 0):7.2f} s\n")
+        report.write(f"    ├── Sort & Extract: {carma_stats.get('sort', 0):7.2f} s\n")
+        report.write(f"    ├── RMSD Calc     : {carma_stats.get('rmsd', 0):7.2f} s\n")
+        report.write(f"    └── Superposition : {carma_stats.get('super', 0):7.2f} s\n\n")
+        
+        report.write("--- STRUCTURAL POPULATIONS ---\n")
+        report.write(f"Total clusters found : {len(unique_clusters)}\n")
+        for cid in unique_clusters:
+            count = np.sum(labels == cid)
+            percentage = (count / total_frames) * 100
+            rmsd_val = cluster_rmsds.get(cid, -1.0)
+            rmsd_str = f"{rmsd_val:.2f} A" if rmsd_val >= 0 else "N/A"
+            report.write(f"  Cluster {cid:2d} : {count:7d} frames ({percentage:5.1f}%) | Max RMSD: {rmsd_str}\n")
+        
+        noise_percentage = (noise_frames / total_frames) * 100
+        report.write(f"  Noise     : {noise_frames:7d} frames ({noise_percentage:5.1f}%)\n")
+        report.write("==================================================\n")
+        
+    logging.info(f"[+] Report saved to: {report_filename}")
+    logging.info(f"\n=== Complete. All files saved to {results_dir}/ ===")
 
 if __name__ == "__main__":
     main()

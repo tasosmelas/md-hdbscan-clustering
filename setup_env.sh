@@ -18,7 +18,7 @@ fi
 # 1. Get the absolute path to the scripts directory
 SCRIPTS_DIR=$(realpath ./scripts)
 
-# 2. Make every Python/Bash file inside the scripts folder executable
+# 2. Make every file inside the scripts folder executable
 echo "[*] Making scripts executable..."
 chmod +x "$SCRIPTS_DIR"/*
 
