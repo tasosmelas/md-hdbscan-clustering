@@ -1,5 +1,12 @@
-numpy>=1.20.0,<1.21.0
-scikit-learn>=1.0.0,<1.1.0
+# Legacy CentOS safety locks (Python 3.9 and older)
+numpy>=1.20.0,<1.21.0 ; python_version < "3.10"
+scikit-learn>=1.0.0,<1.1.0 ; python_version < "3.10"
+
+# Modern environment flexibility (Python 3.10 and newer)
+numpy>=1.20.0 ; python_version >= "3.10"
+scikit-learn>=1.0.0 ; python_version >= "3.10"
+
+# Universal packages
 hdbscan
 matplotlib
 psutil
