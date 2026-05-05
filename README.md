@@ -13,7 +13,7 @@ Before running this pipeline, ensure your system has the following installed:
 * **CARMA** (Must be installed and accessible in your system `PATH`)
 
 ## Repository Structure
-* `scripts/`: Contains the executable Python tools (`cluster`).
+* `scripts/`: Contains the executable Python tools (`clusterMD`).
 * `setup_env.sh`: Automated environment installer and dependency manager.
 * `requirements.txt`: Python package dependencies (NumPy, HDBSCAN, Matplotlib).
 
