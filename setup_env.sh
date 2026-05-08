@@ -22,9 +22,9 @@ SCRIPTS_DIR=$(realpath ./scripts)
 echo "[*] Making scripts executable..."
 chmod +x "$SCRIPTS_DIR"/*
 
-# 3. Install dependencies
+# 3. Install dependencies cleanly inside the active virtual environment
 echo "[*] Ensuring all Python dependencies are installed..."
-pip3 install --user -r requirements.txt --break-system-packages
+pip install -r requirements.txt
 
 echo "-------------------------------------------------------"
 echo "[+] SETUP COMPLETE!"
