@@ -22,9 +22,9 @@ SCRIPTS_DIR=$(realpath ./scripts)
 echo "[*] Making scripts executable..."
 chmod +x "$SCRIPTS_DIR"/*
 
-# 3. Install dependencies cleanly inside the active virtual environment
+# 3. Install dependencies cleanly bound to the active Python 3 environment
 echo "[*] Ensuring all Python dependencies are installed..."
-pip install -r requirements.txt
+python3 -m pip install -r requirements.txt
 
 echo "-------------------------------------------------------"
 echo "[+] SETUP COMPLETE!"

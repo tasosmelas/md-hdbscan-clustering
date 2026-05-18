@@ -146,31 +146,25 @@ def calculate_variance_explained(dim_used, target_dir):
 
 def plot_landscape(pc_x, pc_y, labels, unique_clusters, xlabel, ylabel, out_prefix, xlim=None, ylim=None):
     """
-    Generates 2D scatter projections of the conformational space.
+    Generates 2D PNG scatter projections of the conformational space.
     """
     cmap = plt.get_cmap('turbo')
-    for ext in ['.png', '.ps']:
-        plt.figure(figsize=(12, 10)) 
-        plt.scatter(pc_x, pc_y, color='lightgrey', s=1, alpha=0.5 if ext == '.png' else 1.0, label='Transition States')
-        for i, cid in enumerate(unique_clusters):
-            mask = (labels == cid)
-            cluster_color = cmap(i / max(1, (len(unique_clusters) - 1)))
-            if ext == '.ps': 
-                cluster_color = cluster_color[:3]
-            plt.scatter(pc_x[mask], pc_y[mask], color=cluster_color, s=2, alpha=0.8 if ext=='.png' else 1.0, label=f'Cluster {cid}')
-        plt.title(f'Conformational Projection: {xlabel} vs {ylabel}')
-        plt.xlabel(xlabel)
-        plt.ylabel(ylabel)
-        if xlim: plt.xlim(xlim)
-        if ylim: plt.ylim(ylim)
-        plt.gca().set_aspect('equal')
-        if len(unique_clusters) <= 35:
-            plt.legend(markerscale=5, loc='center left', bbox_to_anchor=(1, 0.5), framealpha=1.0 if ext=='.ps' else 0.8)
-        if ext == '.png': 
-            plt.savefig(f"{out_prefix}{ext}", dpi=600, bbox_inches='tight')
-        else: 
-            plt.savefig(f"{out_prefix}{ext}", format='ps', bbox_inches='tight')
-        plt.close()
+    plt.figure(figsize=(12, 10)) 
+    plt.scatter(pc_x, pc_y, color='lightgrey', s=0.5, alpha=0.5, label='Transition States')
+    for i, cid in enumerate(unique_clusters):
+        mask = (labels == cid)
+        cluster_color = cmap(i / max(1, (len(unique_clusters) - 1)))
+        plt.scatter(pc_x[mask], pc_y[mask], color=cluster_color, s=1.0, alpha=0.8, label=f'Cluster {cid}')
+    plt.title(f'Conformational Projection: {xlabel} vs {ylabel}')
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    if xlim: plt.xlim(xlim)
+    if ylim: plt.ylim(ylim)
+    plt.gca().set_aspect('equal')
+    if len(unique_clusters) <= 35:
+        plt.legend(markerscale=5, loc='center left', bbox_to_anchor=(1, 0.5), framealpha=0.8)
+    plt.savefig(f"{out_prefix}.png", dpi=600, bbox_inches='tight')
+    plt.close()
 
 def generate_fes_map(pc_x, pc_y, labels, unique_clusters, results_dir, xlim=None, ylim=None):
     """
@@ -287,15 +281,26 @@ def main():
 
     logging.info("[*] Generating graphical projections...")
     t0 = time.time()
+    
     if n_dimensions >= 2:
-        x_min, x_max = data_nd[:, 0].min(), data_nd[:, 0].max()
-        y_min, y_max = data_nd[:, 1].min(), data_nd[:, 1].max()
-        x_pad = (x_max - x_min) * 0.05
-        y_pad = (y_max - y_min) * 0.05
-        xlim = (x_min - x_pad, x_max + x_pad)
-        ylim = (y_min - y_pad, y_max + y_pad)
-        plot_landscape(data_nd[:, 0], data_nd[:, 1], labels, unique_clusters, "PC1", "PC2", os.path.join(results_dir, "landscape_PC1_vs_PC2"), xlim, ylim)
-        generate_fes_map(data_nd[:, 0], data_nd[:, 1], labels, unique_clusters, results_dir, xlim, ylim)
+        x_pad = (data_nd[:, 0].max() - data_nd[:, 0].min()) * 0.05
+        y_pad = (data_nd[:, 1].max() - data_nd[:, 1].min()) * 0.05
+        xlim12 = (data_nd[:, 0].min() - x_pad, data_nd[:, 0].max() + x_pad)
+        ylim12 = (data_nd[:, 1].min() - y_pad, data_nd[:, 1].max() + y_pad)
+        
+        plot_landscape(data_nd[:, 0], data_nd[:, 1], labels, unique_clusters, "PC1", "PC2", os.path.join(results_dir, "landscape_PC1_vs_PC2"), xlim12, ylim12)
+        generate_fes_map(data_nd[:, 0], data_nd[:, 1], labels, unique_clusters, results_dir, xlim12, ylim12)
+        
+    if n_dimensions >= 3:
+        z_pad = (data_nd[:, 2].max() - data_nd[:, 2].min()) * 0.05
+        xlim13 = xlim12
+        ylim13 = (data_nd[:, 2].min() - z_pad, data_nd[:, 2].max() + z_pad)
+        plot_landscape(data_nd[:, 0], data_nd[:, 2], labels, unique_clusters, "PC1", "PC3", os.path.join(results_dir, "landscape_PC1_vs_PC3"), xlim13, ylim13)
+        
+        xlim23 = ylim12
+        ylim23 = ylim13
+        plot_landscape(data_nd[:, 1], data_nd[:, 2], labels, unique_clusters, "PC2", "PC3", os.path.join(results_dir, "landscape_PC2_vs_PC3"), xlim23, ylim23)
+
     timing_stats['plots'] = time.time() - t0
 
     logging.info("\n[*] Initiating automated structural extraction via CARMA...")
@@ -369,7 +374,7 @@ def main():
             if args.rmsd > 0.0:
                 fh.stream.write(f"      -> Executing Real 3D RMSD Filter (Threshold: {args.rmsd} A)...\n")
                 fh.flush()
-                temp_full_dcd = f"temp_full_{cid}.dcd"
+                temp_full_dcd = f"temp_full_{cid:04d}.dcd"
                 np.savetxt("temp_frames.dat", cluster_frames, fmt='%d')
                 run_and_log_carma(["carma", "-v", "-sort", "temp_frames.dat", original_dcd])
                 if os.path.exists("carma.reordered.dcd"):
@@ -402,12 +407,12 @@ def main():
                 sys.stdout.write(f"\r    -> Cluster {cid:2d} ({i+1}/{total_clusters}) : Extracted {initial_frame_count} frames.                 \n")
                 sys.stdout.flush()
 
-            frame_list_file = f"temp_frames_cluster_{cid}.dat"
+            frame_list_file = f"temp_frames_cluster_{cid:04d}.dat"
             np.savetxt(frame_list_file, cluster_frames, fmt='%d')
             t_sub = time.time()
             run_and_log_carma(["carma", "-v", "-sort", frame_list_file, original_dcd])
             carma_stats['sort'] += (time.time() - t_sub)
-            final_dcd_name = os.path.join(results_dir, f"cluster_{cid}.dcd")
+            final_dcd_name = os.path.join(results_dir, f"cluster_{cid:04d}.dcd")
             if os.path.exists("carma.reordered.dcd"):
                 os.rename("carma.reordered.dcd", final_dcd_name)
             t_sub = time.time()
@@ -424,7 +429,7 @@ def main():
             run_and_log_carma(["carma", "-v", "-w", "-cov", "-dot", "-super"] + atom_flags + [final_dcd_name, original_psf])
             carma_stats['super'] += (time.time() - t_sub)
             if os.path.exists("carma.superposition.pdb"):
-                os.rename("carma.superposition.pdb", os.path.join(results_dir, f"cluster_{cid}_superposition.pdb"))
+                os.rename("carma.superposition.pdb", os.path.join(results_dir, f"cluster_{cid:04d}_superposition.pdb"))
             if os.path.exists("carma.average.pdb"):
                 os.remove("carma.average.pdb")
             t_sub = time.time()
@@ -432,7 +437,7 @@ def main():
             carma_stats['sort'] += (time.time() - t_sub)
             extracted_pdbs = [f for f in glob.glob("*.pdb") if "superposition" not in f and "average" not in f and "cluster_" not in f]
             if extracted_pdbs:
-                os.rename(extracted_pdbs[0], os.path.join(results_dir, f"cluster_{cid}_medoid.pdb"))
+                os.rename(extracted_pdbs[0], os.path.join(results_dir, f"cluster_{cid:04d}_medoid.pdb"))
                 for extra_pdb in extracted_pdbs[1:]: os.remove(extra_pdb)
             for f in glob.glob("*varcov*") + glob.glob("carma.*") + glob.glob("*.rmsdev.ps") + glob.glob("*.averag.ps") + [frame_list_file]:
                 try: os.remove(f)
