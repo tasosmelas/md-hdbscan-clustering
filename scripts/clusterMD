@@ -15,6 +15,7 @@ import subprocess
 import warnings
 import psutil
 import logging
+import math
 
 warnings.filterwarnings("ignore")
 
@@ -26,9 +27,13 @@ logging.info("=== Initializing HDBSCAN Clustering Pipeline ===")
 parser = argparse.ArgumentParser(description="Automated HDBSCAN clustering and structural extraction pipeline for CARMA PCA data.")
 parser.add_argument('--size', type=int, default=500, help='Explicit minimum cluster size parameter (Default: 500)')
 parser.add_argument('--samples', type=int, default=50, help='Explicit minimum samples parameter (Default: 50)')
+parser.add_argument('--auto', action='store_true', help='Autoscale size and samples based on frame count')
 parser.add_argument('--method', type=str, default='leaf', choices=['eom', 'leaf'], help='Cluster selection methodology (Default: leaf)')
 parser.add_argument('--dim', type=int, default=0, help='Dimensionality subspace for analysis (0 = All available PCs)')
 parser.add_argument('--rmsd', type=float, default=0.0, help='Real 3D RMSD cutoff (A) for core extraction. Exceeding frames are discarded. (0 = Disabled)')
+parser.add_argument('--temp', type=float, default=298.0, help='Simulation temperature in Kelvin for Free Energy conversion (Default: 298.0)')
+parser.add_argument('--step', type=int, default=1, help='Frame stride for memory management on massive trajectories (Default: 1)')
+parser.add_argument('--segid', type=str, default=None, help='Target specific segment identifier for structural extraction (e.g., A)')
 args = parser.parse_args()
 
 # Input data discovery and validation
@@ -112,6 +117,9 @@ def parse_carma_log_for_atoms(target_dir):
         with open(log_files[0], 'r') as f:
             for line in f:
                 if "atoms are declared in the PSF file" in line:
+                    if "non-hydrogen" in line:
+                        logging.info("[*] Extracted PCA atom selection from execution log: HEAVY (non-hydrogen)")
+                        return ["-atmid", "HEAVY"]
                     parts = line.split()
                     atoms_idx = parts.index("atoms")
                     atom_names = parts[1:atoms_idx]
@@ -166,38 +174,49 @@ def plot_landscape(pc_x, pc_y, labels, unique_clusters, xlabel, ylabel, out_pref
     plt.savefig(f"{out_prefix}.png", dpi=600, bbox_inches='tight')
     plt.close()
 
-def generate_fes_map(pc_x, pc_y, labels, unique_clusters, results_dir, xlim=None, ylim=None):
+def generate_fes_map(pc_x, pc_y, labels, unique_clusters, results_dir, temp, xlim=None, ylim=None):
     """
     Converts 2D Principal Component distributions into a Topographic 
-    Free Energy Surface (FES) represented in k_B T units.
+    Free Energy Surface (FES) represented in kcal/mol.
     """
-    logging.info("[*] Generating Topographic Free Energy Surface (FES)...")
+    logging.info(f"[*] Generating Topographic Free Energy Surface (FES) at {temp} K...")
     hist, xedges, yedges = np.histogram2d(pc_x, pc_y, bins=150)
     max_pop = np.max(hist)
-    free_energy = -np.log((hist.T + 1e-10) / max_pop)
-    fe_cap = 9.0
+    
+    # Calculate thermal energy (k_B * T) in kcal/mol
+    R_kcal = 0.0019872041
+    k_B_T = R_kcal * temp
+    
+    free_energy = -k_B_T * np.log((hist.T + 1e-10) / max_pop)
+    fe_cap = 9.0 * k_B_T
     free_energy[free_energy > fe_cap] = fe_cap 
+    
     x_centers = (xedges[:-1] + xedges[1:]) / 2
     y_centers = (yedges[:-1] + yedges[1:]) / 2
     X, Y = np.meshgrid(x_centers, y_centers)
+    
     fig, ax = plt.subplots(figsize=(12, 10))
     levels = np.linspace(0, fe_cap, 16)
     contour = ax.contourf(X, Y, free_energy, levels=levels, cmap='turbo_r', extend='max')
     ax.contour(X, Y, free_energy, levels=levels, colors='black', alpha=0.1, linewidths=0.5)
+    
     for cid in unique_clusters:
         mask = (labels == cid)
         cx, cy = np.median(pc_x[mask]), np.median(pc_y[mask])
         ax.text(cx, cy, str(cid), fontsize=9, fontweight='bold', color='black',
                 ha='center', va='center',
                 bbox=dict(facecolor='white', alpha=0.7, edgecolor='none', pad=1))
+                
     cbar = fig.colorbar(contour)
-    cbar.set_label('Free Energy ($k_B T$)', fontsize=12, fontweight='bold')
-    ax.set_title('Free Energy Landscape (PC1 vs PC2)', fontsize=16, fontweight='bold')
+    cbar.set_label('Free Energy (kcal/mol)', fontsize=12, fontweight='bold')
+    ax.set_title(f'Free Energy Landscape ({temp} K)', fontsize=16, fontweight='bold')
     ax.set_xlabel('Principal Component 1')
     ax.set_ylabel('Principal Component 2')
+    
     if xlim: ax.set_xlim(xlim)
     if ylim: ax.set_ylim(ylim)
     ax.set_aspect('equal')
+    
     out_path_2d = os.path.join(results_dir, "FES_Landscape_2D_PC1_vs_PC2.png")
     plt.savefig(out_path_2d, dpi=600, bbox_inches='tight')
     plt.close()
@@ -218,6 +237,10 @@ def main():
         logging.error(f"[-] Data ingestion failed: {e}")
         sys.exit(1)
         
+    if args.step > 1:
+        raw_data = raw_data[::args.step]
+        logging.info(f"[*] Applied frame stride of {args.step}.")
+        
     frames = raw_data[:, 0].astype(int)
     data_nd = raw_data[:, 1:] 
     
@@ -229,12 +252,21 @@ def main():
     timing_stats['load'] = time.time() - t0
     logging.info(f"[+] Data ingested successfully: {total_frames:,} frames ({n_dimensions}D).")
 
-    dynamic_size = args.size
-    dynamic_samples = args.samples if args.samples is not None else max(2, int(dynamic_size / 10.0))
+    if args.auto:
+        scale_factor = math.sqrt(total_frames / 1_000_000.0)
+        dynamic_size = max(100, int(500 * scale_factor))
+        dynamic_samples = max(10, int(dynamic_size / 10.0))
+        logging.info(f"[*] Auto-scaling activated: total_frames={total_frames:,}")
+    else:
+        dynamic_size = args.size
+        dynamic_samples = args.samples if args.samples is not None else max(2, int(dynamic_size / 10.0))
 
     logging.info("\n[*] Parameter Configuration:")
     logging.info(f"    -> Minimum Cluster Size : {dynamic_size} frames")
     logging.info(f"    -> Minimum Samples      : {dynamic_samples} frames")
+    logging.info(f"    -> Simulation Temp      : {args.temp} K")
+    if args.segid:
+        logging.info(f"    -> Target Segment ID    : {args.segid}")
     if args.rmsd > 0.0:
         logging.info(f"    -> 3D Core Filter       : Excluding frames exceeding {args.rmsd} A RMSD from Medoid")
 
@@ -289,7 +321,7 @@ def main():
         ylim12 = (data_nd[:, 1].min() - y_pad, data_nd[:, 1].max() + y_pad)
         
         plot_landscape(data_nd[:, 0], data_nd[:, 1], labels, unique_clusters, "PC1", "PC2", os.path.join(results_dir, "landscape_PC1_vs_PC2"), xlim12, ylim12)
-        generate_fes_map(data_nd[:, 0], data_nd[:, 1], labels, unique_clusters, results_dir, xlim12, ylim12)
+        generate_fes_map(data_nd[:, 0], data_nd[:, 1], labels, unique_clusters, results_dir, args.temp, xlim12, ylim12)
         
     if n_dimensions >= 3:
         z_pad = (data_nd[:, 2].max() - data_nd[:, 2].min()) * 0.05
@@ -313,8 +345,11 @@ def main():
         if carma_dirs:
             search_link_dir = max(carma_dirs, key=os.path.getmtime)
             
-    # Extract structural variance and topological flags
+    # Extract structural variance and construct unified CARMA flags
     atom_flags = parse_carma_log_for_atoms(search_link_dir)
+    segid_flag = ["-segid", args.segid] if args.segid else []
+    extraction_flags = atom_flags + segid_flag
+    
     variance_str = calculate_variance_explained(args.dim, target_analysis_dir)
     
     # Isolate original topology and trajectory references
@@ -379,7 +414,7 @@ def main():
                 run_and_log_carma(["carma", "-v", "-sort", "temp_frames.dat", original_dcd])
                 if os.path.exists("carma.reordered.dcd"):
                     os.rename("carma.reordered.dcd", temp_full_dcd)
-                run_and_log_carma(["carma", "-v", "-fit", "-reference", str(medoid_idx_carma)] + atom_flags + [temp_full_dcd, original_psf])
+                run_and_log_carma(["carma", "-v", "-fit", "-reference", str(medoid_idx_carma)] + extraction_flags + [temp_full_dcd, original_psf])
                 if os.path.exists("carma.fit-rms.dat"):
                     try:
                         rmsd_data = np.loadtxt("carma.fit-rms.dat")
@@ -416,7 +451,7 @@ def main():
             if os.path.exists("carma.reordered.dcd"):
                 os.rename("carma.reordered.dcd", final_dcd_name)
             t_sub = time.time()
-            rmsd_output = run_and_log_carma(["carma", "-v", "-rms"] + atom_flags + [final_dcd_name, original_psf])
+            rmsd_output = run_and_log_carma(["carma", "-v", "-rms"] + extraction_flags + [final_dcd_name, original_psf])
             carma_stats['rmsd'] += (time.time() - t_sub)
             cluster_rmsds[cid] = -1.0
             for line in rmsd_output.splitlines():
@@ -426,14 +461,14 @@ def main():
             
             # Extract representative medoid and perform structural superposition
             t_sub = time.time()
-            run_and_log_carma(["carma", "-v", "-w", "-cov", "-dot", "-super"] + atom_flags + [final_dcd_name, original_psf])
+            run_and_log_carma(["carma", "-v", "-w", "-cov", "-dot", "-super"] + extraction_flags + [final_dcd_name, original_psf])
             carma_stats['super'] += (time.time() - t_sub)
             if os.path.exists("carma.superposition.pdb"):
                 os.rename("carma.superposition.pdb", os.path.join(results_dir, f"cluster_{cid:04d}_superposition.pdb"))
             if os.path.exists("carma.average.pdb"):
                 os.remove("carma.average.pdb")
             t_sub = time.time()
-            run_and_log_carma(["carma", "-v", "-first", str(medoid_frame), "-last", str(medoid_frame), "-pdb", original_dcd, original_psf])
+            run_and_log_carma(["carma", "-v", "-first", str(medoid_frame), "-last", str(medoid_frame), "-pdb"] + extraction_flags + [original_dcd, original_psf])
             carma_stats['sort'] += (time.time() - t_sub)
             extracted_pdbs = [f for f in glob.glob("*.pdb") if "superposition" not in f and "average" not in f and "cluster_" not in f]
             if extracted_pdbs:
@@ -472,11 +507,18 @@ def main():
         report.write("==================================================\n\n")
         report.write("--- ANALYSIS PARAMETERS ---\n")
         report.write(f"Total Frames Processed : {total_frames:,}\n")
+        report.write(f"Frame Stride           : {args.step}\n")
         report.write(f"Dimensionality Subspace: {n_dimensions} (Capturing {variance_str} of structural variance)\n")
         report.write(f"Clustering Methodology : {args.method}\n")
+        
+        auto_status = "Active (Sub-linear scaling)" if args.auto else "Inactive (Manual)"
+        report.write(f"Auto-Scaling           : {auto_status}\n")
         report.write(f"Minimum Cluster Volume : {dynamic_size} frames\n")
         report.write(f"Minimum Density Samples: {dynamic_samples} frames\n")
-        report.write(f"Structural Core Filter : {'Active' if args.rmsd > 0 else 'Inactive'}\n\n")
+        
+        report.write(f"Structural Core Filter : {'Active' if args.rmsd > 0 else 'Inactive'}\n")
+        report.write(f"Simulation Temp        : {args.temp} K\n")
+        report.write(f"Target SegID           : {args.segid if args.segid else 'ALL'}\n\n")
         report.write("--- SYSTEM PROFILING & COMPUTATIONAL EFFICIENCY ---\n")
         report.write(f"Logical Cores Utilized : {cpu_cores}\n")
         report.write(f"Peak Memory Allocation : {peak_ram_gb:.2f} GB\n")
