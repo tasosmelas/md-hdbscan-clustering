@@ -41,7 +41,7 @@ def format_time(seconds):
 def format_line(raw_line, frame_val, cid_val):
     """Parses a raw data line and aligns it into a clean, readable column format."""
     coords_str = " ".join([f"{c:9.5f}" for c in raw_line])
-    return f"Frame {frame_val:7d} | Cluster {cid_val:2d} | PCs: {coords_str}"
+    return f"Frame {frame_val:7d} | Cluster {cid_val:4d} | PCs: {coords_str}"
 
 # Configure logging infrastructure
 logging.basicConfig(level=logging.INFO, format='%(message)s', handlers=[logging.StreamHandler(sys.stdout)])
@@ -140,6 +140,20 @@ else:
 
 
 # =========================================================================
+# HEAVY DEPENDENCY IMPORTS (Deferred until fast boot succeeds)
+# =========================================================================
+logging.info(f"{Colors.LIGHT_BLUE}[*]{Colors.RESET} Initializing core scientific dependencies (Numba, HDBSCAN, Matplotlib)...")
+import fast_hdbscan
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import networkx as nx
+from scipy.cluster.hierarchy import linkage, dendrogram
+from scipy.spatial.distance import squareform, pdist
+logging.info(f"{Colors.BLUE}[+]{Colors.RESET} Dependencies loaded successfully.\n")
+
+
+# =========================================================================
 # MEMORY-EFFICIENT DATA LOADER
 # =========================================================================
 def load_data_efficiently(file_path, step=1):
@@ -163,8 +177,12 @@ def load_data_efficiently(file_path, step=1):
             if i % step == 0:
                 parts = line.split()
                 if parts:
-                    data[idx] = [float(x) for x in parts]
-                    idx += 1
+                    if len(parts) == num_cols:
+                        data[idx] = [float(x) for x in parts]
+                        idx += 1
+                    else:
+                        logging.warning(f"{Colors.YELLOW}[-]{Colors.RESET} Format anomaly at line {i}: expected {num_cols} cols, found {len(parts)}. Frame skipped.")
+                        
     return data[:idx]
 
 
@@ -178,7 +196,7 @@ def print_top_transitions(transitions, top_n):
     logging.info("    " + "-"*35)
     sorted_transitions = sorted(transitions.items(), key=lambda item: item[1], reverse=True)
     for edge, count in sorted_transitions[:top_n]:
-        logging.info(f"    Edge {edge[0]:2d} <--> {edge[1]:2d}      | {count:5d} jumps")
+        logging.info(f"    Edge {edge[0]:4d} <--> {edge[1]:4d}      | {count:5d} jumps")
     return sorted_transitions
 
 def hunt_and_print_events(target_edge, labels, frames, data_nd, max_events):
@@ -298,16 +316,6 @@ def run_validation():
 # MODE 2: FULL EXTRACTION & PLOTTING PIPELINE
 # =========================================================================
 def main():
-    logging.info(f"{Colors.LIGHT_BLUE}[*]{Colors.RESET} Initializing core scientific dependencies (HDBSCAN, Matplotlib, NetworkX, SciPy)...")
-    import fast_hdbscan
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    import networkx as nx
-    from scipy.cluster.hierarchy import linkage, dendrogram
-    from scipy.spatial.distance import squareform, pdist
-    logging.info(f"{Colors.BLUE}[+]{Colors.RESET} Dependencies loaded successfully.\n")
-
     pipeline_start = time.time()
     process = psutil.Process(os.getpid())
     timing_stats = {'load': 0, 'hdbscan': 0, 'export': 0, 'plots': 0, 'extract': 0}
@@ -369,7 +377,7 @@ def main():
     logging.info("\n    Population Distribution:")
     for cid in unique_clusters:
         count = np.sum(labels == cid)
-        logging.info(f"      Cluster {cid:2d}: {count:7d} frames ({(count / total_frames) * 100:5.1f}%)")
+        logging.info(f"      Cluster {cid:4d}: {count:7d} frames ({(count / total_frames) * 100:5.1f}%)")
     logging.info(f"      Transition: {noise_frames:7d} frames ({(noise_frames / total_frames) * 100:5.1f}%)")
 
     t0 = time.time()
@@ -412,7 +420,7 @@ def main():
         jf.write(f"{'Edge (A <-> B)':<20} | {'Jump Count':<10}\n")
         jf.write("-" * 35 + "\n")
         for edge, count in sorted_jumps:
-            jf.write(f"Cluster {edge[0]:2d} <--> Cluster {edge[1]:2d} | {count:5d} jumps\n")
+            jf.write(f"Cluster {edge[0]:4d} <--> Cluster {edge[1]:4d} | {count:5d} jumps\n")
     logging.info(f"{Colors.BLUE}[+]{Colors.RESET} Full transition frequency log saved to: {jumps_file}")
 
     # Validate specific transitions inline if requested
@@ -617,10 +625,10 @@ def main():
         
         for i, cid in enumerate(unique_clusters):
             
-            total_str = f"({i+1}/{total_clusters})"
-            sys.stdout.write(f"\r    -> Cluster {cid:2d} {total_str:>8} : Processing structural core...       ")
+            total_str = f"({i+1:4d}/{total_clusters:4d})"
+            sys.stdout.write(f"\r    -> Cluster {cid:4d} {total_str} : Processing structural core...       ")
             sys.stdout.flush()
-            fh.stream.write(f"    -> Processing Structural Core: Cluster {cid}...\n")
+            fh.stream.write(f"    -> Processing Structural Core: Cluster {cid:4d}...\n")
             fh.flush()
             
             cluster_mask = (labels == cid)
@@ -650,11 +658,11 @@ def main():
                         if retained_count > 0:
                             cluster_frames = cluster_frames[core_mask]
                             fh.stream.write(f"      -> Filter applied successfully: Retained {retained_count}/{initial_frame_count} rigid structural frames.\n")
-                            msg = f"Retained  {retained_count:7d} / {initial_frame_count:7d} core frames."
-                            sys.stdout.write(f"\r    -> Cluster {cid:2d} {total_str:>8} : {msg:<55}\n")
+                            msg = f"Retained {retained_count}/{initial_frame_count} frames."
+                            sys.stdout.write(f"\r    -> Cluster {cid:4d} {total_str} : {msg:<34}\n")
                         else:
-                            msg = f"[WARNING]       0 / {initial_frame_count:7d} frames passed filter."
-                            sys.stdout.write(f"\r    {Colors.YELLOW}-> Cluster {cid:2d} {total_str:>8} : {msg:<55}{Colors.RESET}\n")
+                            msg = f"[WARNING] 0 frames passed filter."
+                            sys.stdout.write(f"\r    {Colors.YELLOW}-> Cluster {cid:4d} {total_str} : {msg:<34}{Colors.RESET}\n")
                         sys.stdout.flush()
                     except Exception as e: 
                         logging.warning(f"\n      {Colors.YELLOW}[-]{Colors.RESET} Warning: RMSD evaluation failed ({e}).")
@@ -663,8 +671,8 @@ def main():
                     except OSError: pass
             else:
                 fh.stream.write(f"      -> Extraction Success: Retained {initial_frame_count}/{initial_frame_count} frames (3D Filter inactive).\n")
-                msg = f"Extracted {initial_frame_count:7d} frames."
-                sys.stdout.write(f"\r    -> Cluster {cid:2d} {total_str:>8} : {msg:<55}\n")
+                msg = f"Extracted {initial_frame_count} frames."
+                sys.stdout.write(f"\r    -> Cluster {cid:4d} {total_str} : {msg:<34}\n")
                 sys.stdout.flush()
 
             frame_list_file = f"temp_frames_cluster_{cid:04d}.dat"
@@ -756,8 +764,9 @@ def main():
         report.write("--- THERMODYNAMIC POPULATIONS ---\n") 
         for cid in unique_clusters:
             count = np.sum(labels == cid)
+            percentage = (count / total_frames) * 100
             rmsd_str = f"{cluster_rmsds.get(cid, -1.0):.2f} A" if cluster_rmsds.get(cid, -1.0) >= 0 else "N/A"
-            report.write(f"  Cluster {cid:2d} : {count:7d} frames ({(count / total_frames) * 100:5.1f}%) | Max Internal RMSD: {rmsd_str}\n")
+            report.write(f"  Cluster {cid:4d} : {count:7d} frames ({percentage:5.1f}%) | Max Internal RMSD: {rmsd_str}\n")
         report.write("==================================================\n")
     
     logging.info(f"{Colors.BLUE}[+]{Colors.RESET} Execution report successfully generated: {report_filename}")
