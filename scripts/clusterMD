@@ -4,7 +4,6 @@ Automating the multidimensional density-based clustering of data derived from a
 Principal Component Analysis of molecular dynamics trajectories using fast-hdbscan.
 """
 
-# Core utility and system modules (Fast Boot)
 import os
 import sys
 import glob
@@ -17,6 +16,7 @@ import psutil
 import logging
 import math
 import shutil
+import tempfile
 import numpy as np
 
 warnings.filterwarnings("ignore")
@@ -43,134 +43,31 @@ def format_line(raw_line, frame_val, cid_val):
     coords_str = " ".join([f"{c:9.5f}" for c in raw_line])
     return f"Frame {frame_val:7d} | Cluster {cid_val:4d} | PCs: {coords_str}"
 
-# Configure logging infrastructure
-logging.basicConfig(level=logging.INFO, format='%(message)s', handlers=[logging.StreamHandler(sys.stdout)])
 
 # =========================================================================
-# CLI PARAMETER CONFIGURATION
-# =========================================================================
-parser = argparse.ArgumentParser(description="Automated HDBSCAN clustering, kinetic networks, and structural extraction pipeline.")
-
-# Clustering Args
-parser.add_argument('--size', type=int, default=500, help='Explicit minimum cluster size parameter (Default: 500)')
-parser.add_argument('--samples', type=int, default=50, help='Explicit minimum samples parameter (Default: 50)')
-parser.add_argument('--auto', action='store_true', help='Autoscale size and samples based on frame count')
-parser.add_argument('--method', type=str, default='eom', choices=['eom', 'leaf'], help='Cluster selection methodology (Default: eom)')
-parser.add_argument('--dim', type=int, default=0, help='Dimensionality subspace for analysis (0 = All available PCs)')
-parser.add_argument('--rmsd', type=float, default=0.0, help='Real 3D RMSD cutoff (A) for core extraction. Exceeding frames are discarded. (0 = Disabled)')
-parser.add_argument('--temp', type=float, default=298.0, help='Simulation temperature in Kelvin for Free Energy conversion (Default: 298.0)')
-parser.add_argument('--step', type=int, default=1, help='Frame stride for memory management on massive trajectories (Default: 1)')
-parser.add_argument('--segid', type=str, default=None, help='Target specific segment identifier for structural extraction (e.g., A)')
-
-# Kinetic & Validation Args
-parser.add_argument('--min-jumps', type=int, default=3, help="Minimum transition events required to draw an edge (Default: 3)")
-parser.add_argument('--transitions', nargs='*', type=int, help="Pass 0 args to view top jumps, or 2 args to validate a specific physical edge.")
-parser.add_argument('--top', type=int, default=15, help="Number of top transitions to display in the diagnostic table (Default: 15)")
-parser.add_argument('--events', type=int, default=3, help="Max raw transition events to print in diagnostic mode (Default: 3)")
-
-args = parser.parse_args()
-
-if args.transitions is not None and len(args.transitions) not in [0, 2]:
-    parser.error("--transitions requires either 0 arguments (to view top jumps) or 2 arguments (to validate a specific edge).")
-
-# =========================================================================
-# SMART INFERENCE ENGINE: MODE SELECTION
-# =========================================================================
-clustering_flags = ['--size', '--samples', '--auto', '--method', '--dim', '--rmsd', '--step', '--segid']
-is_full_pipeline = True
-
-if args.transitions is not None:
-    passed_clustering_flags = [flag for flag in clustering_flags if flag in sys.argv]
-    if not passed_clustering_flags:
-        is_full_pipeline = False
-
-# =========================================================================
-# FAST BOOT I/O & DEPENDENCY VERIFICATION
-# =========================================================================
-if not shutil.which("carma"):
-    logging.error(f"{Colors.RED}[-]{Colors.RESET} Critical Error: 'carma' binary not found in system $PATH.")
-    logging.error(f"{Colors.YELLOW}[*]{Colors.RESET} Please ensure CARMA is installed and accessible before running this pipeline.")
-    sys.exit(1)
-
-if is_full_pipeline:
-    logging.info(f"{Colors.BOLD}=== Initializing HDBSCAN & Kinetic Clustering Pipeline ==={Colors.RESET}")
-    logging.info(f"{Colors.LIGHT_BLUE}[*]{Colors.RESET} Locating fluctuations file...")
-    
-    fluctuation_files = glob.glob('*fluctuations.dat') or glob.glob('carma_results*/*fluctuations.dat') or glob.glob('../carma_results*/*fluctuations.dat')
-
-    if not fluctuation_files:
-        logging.error(f"{Colors.RED}[-]{Colors.RESET} Critical Error: '*fluctuations.dat' not found in current directory, or any 'carma_results*' subdirectories/parent directories.")
-        logging.error(f"{Colors.RED}[-]{Colors.RESET} Execution terminated before loading scientific libraries.")
-        sys.exit(1)
-
-    if len(fluctuation_files) > 1:
-        logging.warning(f"{Colors.YELLOW}[-]{Colors.RESET} Multiple fluctuation files found. Selecting the most recently modified.")
-    data_file = max(fluctuation_files, key=os.path.getmtime)
-    
-    logging.info(f"{Colors.BLUE}[+]{Colors.RESET} Input file acquired: {data_file}")
-
-    target_analysis_dir = os.path.dirname(data_file)
-    if not target_analysis_dir: target_analysis_dir = '.'
-    logging.info(f"{Colors.LIGHT_BLUE}[*]{Colors.RESET} Targeted Analysis Directory: {target_analysis_dir}")
-
-    timestamp = datetime.datetime.now().strftime("%d.%m.%Y_%H.%M.%S")
-    results_dir = f"clusterMD_results_{timestamp}"
-    os.makedirs(results_dir, exist_ok=True)
-
-    file_handler = logging.FileHandler(os.path.join(results_dir, "clustering_execution.log"))
-    file_handler.setFormatter(logging.Formatter('%(message)s'))
-    logging.getLogger().addHandler(file_handler)
-    logging.info(f"{Colors.LIGHT_BLUE}[*]{Colors.RESET} Output directory established: {results_dir}")
-
-else:
-    logging.info(f"{Colors.BOLD}=== Initializing Post-Run Transition Validation ==={Colors.RESET}")
-    dat_files = glob.glob("hdbscan.*-D.clusters.dat")
-    
-    if not dat_files:
-        logging.error(f"\n{Colors.RED}[-]{Colors.RESET} Critical Error: 'hdbscan.*-D.clusters.dat' not found in the current directory.")
-        logging.error(f"{Colors.YELLOW}[*]{Colors.RESET} You are running clusterMD in Diagnostic Mode without full pipeline flags.")
-        logging.error(f"{Colors.YELLOW}[*]{Colors.RESET} Please navigate INSIDE a 'clusterMD_results_*' folder to run this command.")
-        sys.exit(1)
-        
-    if len(dat_files) > 1:
-        logging.warning(f"{Colors.YELLOW}[-]{Colors.RESET} Multiple cluster dat files found. Selecting the most recently modified.")
-    dat_file = max(dat_files, key=os.path.getmtime)
-    
-    logging.info(f"{Colors.LIGHT_BLUE}[*]{Colors.RESET} Target data located: {os.path.abspath(dat_file)}")
-
-
-# =========================================================================
-# HEAVY DEPENDENCY IMPORTS (Deferred until fast boot succeeds)
-# =========================================================================
-logging.info(f"{Colors.LIGHT_BLUE}[*]{Colors.RESET} Initializing core scientific dependencies (Numba, HDBSCAN, Matplotlib)...")
-import fast_hdbscan
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import networkx as nx
-from scipy.cluster.hierarchy import linkage, dendrogram
-from scipy.spatial.distance import squareform, pdist
-logging.info(f"{Colors.BLUE}[+]{Colors.RESET} Dependencies loaded successfully.\n")
-
-
-# =========================================================================
-# MEMORY-EFFICIENT DATA LOADER
+# MEMORY-EFFICIENT DATA LOADER (Optimized I/O)
 # =========================================================================
 def load_data_efficiently(file_path, step=1):
-    """Reads the file dynamically to prevent OOM errors on massive trajectories."""
+    """Reads the file dynamically to prevent OOM errors on massive trajectories using a single I/O pass."""
     logging.info(f"{Colors.LIGHT_BLUE}[*]{Colors.RESET} Pre-allocating memory and loading data (Stride: {step})...")
-    with open(file_path, 'r') as f:
-        total_lines = sum(1 for _ in f)
     
-    subset_size = math.ceil(total_lines / step)
+    # 1. Fast line count leveraging the OS
+    try:
+        out = subprocess.check_output(['wc', '-l', file_path])
+        total_lines = int(out.split()[0])
+    except Exception:
+        with open(file_path, 'r') as f:
+            total_lines = sum(1 for _ in f)
+            
+    # 2. Extract column structure from the first valid line
     with open(file_path, 'r') as f:
-        for line in f:
-            parts = line.split()
-            if parts:
-                num_cols = len(parts)
-                break
-                
+        first_line = next(f).split()
+        num_cols = len(first_line)
+            
+    subset_size = math.ceil(total_lines / step)
     data = np.zeros((subset_size, num_cols))
+    
+    # 3. Single-pass data ingestion
     with open(file_path, 'r') as f:
         idx = 0
         for i, line in enumerate(f):
@@ -232,13 +129,16 @@ def hunt_and_print_events(target_edge, labels, frames, data_nd, max_events):
 
 
 # ----------------- CARMA Helpers -----------------
-def run_and_log_carma(cmd_list):
-    result = subprocess.run(cmd_list, capture_output=True, text=True)
+def run_and_log_carma(cmd_list, run_dir='.'):
+    """Executes CARMA securely within a specified isolated directory sandbox."""
+    result = subprocess.run(cmd_list, capture_output=True, text=True, cwd=run_dir)
     if result.stdout:
         for line in result.stdout.splitlines(): logging.getLogger().handlers[1].stream.write(line + "\n")
     if result.stderr:
         for line in result.stderr.splitlines(): logging.getLogger().handlers[1].stream.write("ERROR: " + line + "\n")
     logging.getLogger().handlers[1].flush() 
+    if result.returncode != 0:
+        logging.warning(f"{Colors.YELLOW}[-]{Colors.RESET} Warning: CARMA execution returned non-zero exit code ({result.returncode}).")
     return result.stdout
 
 def parse_carma_log_for_atoms(target_dir):
@@ -277,7 +177,7 @@ def calculate_variance_explained(dim_used, target_dir):
 # =========================================================================
 # MODE 1: VALIDATION ONLY
 # =========================================================================
-def run_validation():
+def run_validation(dat_file, args):
     try:
         raw_data = load_data_efficiently(dat_file, step=1)
     except Exception as e:
@@ -315,7 +215,17 @@ def run_validation():
 # =========================================================================
 # MODE 2: FULL EXTRACTION & PLOTTING PIPELINE
 # =========================================================================
-def main():
+def main(data_file, args, results_dir, target_analysis_dir):
+    logging.info(f"{Colors.LIGHT_BLUE}[*]{Colors.RESET} Initializing core scientific dependencies (HDBSCAN, Matplotlib, NetworkX, SciPy)...")
+    import fast_hdbscan
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import networkx as nx
+    from scipy.cluster.hierarchy import linkage, dendrogram
+    from scipy.spatial.distance import squareform, pdist
+    logging.info(f"{Colors.BLUE}[+]{Colors.RESET} Dependencies loaded successfully.\n")
+
     pipeline_start = time.time()
     process = psutil.Process(os.getpid())
     timing_stats = {'load': 0, 'hdbscan': 0, 'export': 0, 'plots': 0, 'extract': 0}
@@ -411,7 +321,6 @@ def main():
             transitions[edge] = transitions.get(edge, 0) + 1
             directed_transitions[(sA, sB)] = directed_transitions.get((sA, sB), 0) + 1
 
-    # Print Top Transitions & Export Full Report automatically
     sorted_jumps = print_top_transitions(transitions, args.top)
     jumps_file = os.path.join(results_dir, "kinetic_jumps_report.txt")
     with open(jumps_file, "w") as jf:
@@ -423,7 +332,6 @@ def main():
             jf.write(f"Cluster {edge[0]:4d} <--> Cluster {edge[1]:4d} | {count:5d} jumps\n")
     logging.info(f"{Colors.BLUE}[+]{Colors.RESET} Full transition frequency log saved to: {jumps_file}")
 
-    # Validate specific transitions inline if requested
     if args.transitions is not None and len(args.transitions) == 2:
         logging.info("\n" + "="*85)
         logging.info(f"{Colors.LIGHT_BLUE}[*]{Colors.RESET} DIAGNOSTIC MODE: VALIDATING TRANSITIONS FOR EDGE {tuple(sorted(args.transitions))}")
@@ -435,22 +343,24 @@ def main():
     t0_plots = time.time()
     pc1, pc2 = data_nd[:, 0], data_nd[:, 1]
 
-    def _plot_landscape(x, y, lx, ly, p1, p2):
+    def _plot_landscape(x, y, lx, ly, p1, p2, out_prefix):
         cmap = plt.get_cmap('turbo')
-        plt.figure(figsize=(12, 10)) 
-        plt.scatter(x, y, color='lightgrey', s=0.5, alpha=0.5, label='Transition States')
+        fig, ax = plt.subplots(figsize=(12, 10)) 
+        ax.scatter(x, y, color='lightgrey', s=0.5, alpha=0.5, label='Transition States')
         for i, cid in enumerate(unique_clusters):
             mask = (labels == cid)
-            plt.scatter(x[mask], y[mask], color=cmap(i / max(1, (len(unique_clusters) - 1))), s=1.0, alpha=0.8, label=f'Cluster {cid}')
-        plt.title(f'Conformational Projection: {p1} vs {p2}')
-        plt.xlabel(p1); plt.ylabel(p2); plt.xlim(lx); plt.ylim(ly); plt.gca().set_aspect('equal')
-        if len(unique_clusters) <= 35: plt.legend(markerscale=5, loc='center left', bbox_to_anchor=(1, 0.5), framealpha=0.8)
-        plt.savefig(os.path.join(results_dir, f"landscape_{p1}_vs_{p2}.png"), dpi=600, bbox_inches='tight'); plt.close()
+            cluster_color = cmap(i / max(1, (len(unique_clusters) - 1)))
+            ax.scatter(x[mask], y[mask], color=cluster_color, s=1.0, alpha=0.8, label=f'Cluster {cid}')
+        ax.set_title(f'Conformational Projection: {p1} vs {p2}')
+        ax.set_xlabel(p1); ax.set_ylabel(p2); ax.set_xlim(lx); ax.set_ylim(ly); ax.set_aspect('equal')
+        if len(unique_clusters) <= 35: ax.legend(markerscale=5, loc='center left', bbox_to_anchor=(1, 0.5), framealpha=0.8)
+        fig.savefig(f"{out_prefix}.png", dpi=600, bbox_inches='tight')
+        plt.close(fig)
 
     if n_dimensions >= 2:
         x_pad, y_pad = (pc1.max() - pc1.min()) * 0.05, (pc2.max() - pc2.min()) * 0.05
         xl12, yl12 = (pc1.min() - x_pad, pc1.max() + x_pad), (pc2.min() - y_pad, pc2.max() + y_pad)
-        _plot_landscape(pc1, pc2, xl12, yl12, "PC1", "PC2")
+        _plot_landscape(pc1, pc2, xl12, yl12, "PC1", "PC2", os.path.join(results_dir, "landscape_PC1_vs_PC2"))
         
         logging.info(f"    -> Rendering Topographic Free Energy Surface (FES) at {args.temp} K...")
         hist, xedges, yedges = np.histogram2d(pc1, pc2, bins=150)
@@ -461,20 +371,22 @@ def main():
         contour = ax.contourf(X, Y, free_energy, levels=np.linspace(0, 9.0 * k_B_T, 16), cmap='turbo_r', extend='max')
         ax.contour(X, Y, free_energy, levels=np.linspace(0, 9.0 * k_B_T, 16), colors='black', alpha=0.1, linewidths=0.5)
         for cid in unique_clusters:
-            cx, cy = np.median(pc1[labels == cid]), np.median(pc2[labels == cid])
+            mask = (labels == cid)
+            cx, cy = np.median(pc1[mask]), np.median(pc2[mask])
             ax.text(cx, cy, str(cid), fontsize=9, fontweight='bold', color='black', ha='center', va='center', bbox=dict(facecolor='white', alpha=0.7, edgecolor='none', pad=1))
-        cbar = fig.colorbar(contour)
+        cbar = fig.colorbar(contour, ax=ax)
         cbar.set_label('Free Energy (kcal/mol)', fontsize=12, fontweight='bold')
         ax.set_title(f'Free Energy Landscape ({args.temp} K)', fontsize=16, fontweight='bold')
         ax.set_xlabel('Principal Component 1'); ax.set_ylabel('Principal Component 2')
         ax.set_xlim(xl12); ax.set_ylim(yl12); ax.set_aspect('equal')
-        plt.savefig(os.path.join(results_dir, "FES_Landscape_2D_PC1_vs_PC2.png"), dpi=600, bbox_inches='tight'); plt.close()
+        fig.savefig(os.path.join(results_dir, "FES_Landscape_2D_PC1_vs_PC2.png"), dpi=600, bbox_inches='tight')
+        plt.close(fig)
 
     if n_dimensions >= 3:
         z_pad = (data_nd[:, 2].max() - data_nd[:, 2].min()) * 0.05
         zl13 = (data_nd[:, 2].min() - z_pad, data_nd[:, 2].max() + z_pad)
-        _plot_landscape(data_nd[:, 0], data_nd[:, 2], xl12, zl13, "PC1", "PC3")
-        _plot_landscape(data_nd[:, 1], data_nd[:, 2], yl12, zl13, "PC2", "PC3")
+        _plot_landscape(data_nd[:, 0], data_nd[:, 2], xl12, zl13, "PC1", "PC3", os.path.join(results_dir, "landscape_PC1_vs_PC3"))
+        _plot_landscape(data_nd[:, 1], data_nd[:, 2], yl12, zl13, "PC2", "PC3", os.path.join(results_dir, "landscape_PC2_vs_PC3"))
 
     # KINETIC PLOTS
     logging.info(f"    -> Rendering Kinetic Network Map...")
@@ -485,7 +397,7 @@ def main():
     if len(G.edges) == 0:
         for edge, count in transitions.items(): G.add_edge(edge[0], edge[1], weight=count)
 
-    plt.figure(figsize=(14, 12))
+    fig, ax = plt.subplots(figsize=(14, 12))
     pos = {state: (np.median(pc1[labels == state]), np.median(pc2[labels == state])) for state in states}
     node_sizes = [float(np.log10(G.nodes[n]['size']) ** 3.5) * 8 for n in G.nodes]
     node_colors = [G.nodes[n]['energy'] for n in G.nodes]
@@ -493,16 +405,17 @@ def main():
     max_w = max(weights) if weights else 1
     edge_widths = [((G[u][v]['weight'] / max_w) * 8) + 0.5 for u, v in G.edges]
 
-    nx.draw_networkx_edges(G, pos, width=edge_widths, alpha=0.4, edge_color='black')
-    nodes = nx.draw_networkx_nodes(G, pos, node_size=node_sizes, node_color=node_colors, cmap=plt.cm.turbo_r, edgecolors='black', linewidths=1.5)
-    nx.draw_networkx_labels(G, pos, {n: str(n) for n in G.nodes}, font_size=11, font_weight='bold', font_color='white')
-    cbar = plt.colorbar(nodes, fraction=0.03, pad=0.04)
+    nx.draw_networkx_edges(G, pos, width=edge_widths, alpha=0.4, edge_color='black', ax=ax)
+    nodes = nx.draw_networkx_nodes(G, pos, node_size=node_sizes, node_color=node_colors, cmap=plt.cm.turbo_r, edgecolors='black', linewidths=1.5, ax=ax)
+    nx.draw_networkx_labels(G, pos, {n: str(n) for n in G.nodes}, font_size=11, font_weight='bold', font_color='white', ax=ax)
+    cbar = fig.colorbar(nodes, fraction=0.03, pad=0.04, ax=ax)
     cbar.set_label('Relative Free Energy (kcal/mol)', fontsize=14, fontweight='bold')
-    plt.axis('on'); plt.grid(True, linestyle='--', alpha=0.3)
-    plt.xlabel('Principal Component 1', fontsize=14, fontweight='bold')
-    plt.ylabel('Principal Component 2', fontsize=14, fontweight='bold')
-    plt.title(f"Kinetic Transition Network Map ({args.temp} K)\nNodes = PC1/PC2 Centroids | Edges = Physical Jumps", fontsize=16, fontweight='bold', pad=20)
-    plt.savefig(os.path.join(results_dir, "Kinetic_Network_Graph.png"), dpi=600, bbox_inches='tight'); plt.close()
+    ax.axis('on'); ax.grid(True, linestyle='--', alpha=0.3)
+    ax.set_xlabel('Principal Component 1', fontsize=14, fontweight='bold')
+    ax.set_ylabel('Principal Component 2', fontsize=14, fontweight='bold')
+    ax.set_title(f"Kinetic Transition Network Map ({args.temp} K)\nNodes = PC1/PC2 Centroids | Edges = Physical Jumps", fontsize=16, fontweight='bold', pad=20)
+    fig.savefig(os.path.join(results_dir, "Kinetic_Network_Graph.png"), dpi=600, bbox_inches='tight')
+    plt.close(fig)
 
     logging.info(f"    -> Rendering Free Energy Disconnectivity Graph...")
     if num_states > 1:
@@ -544,23 +457,25 @@ def main():
         ax.set_title(f'Free Energy Disconnectivity Graph ({args.temp} K)', fontsize=16, fontweight='bold', pad=20)
         ax.spines['top'].set_visible(False); ax.spines['right'].set_visible(False); ax.spines['bottom'].set_visible(False)
         ax.set_xticks([]); ax.set_ylim(0.0 - 0.5, np.max(Z[:, 2]) + 0.5)
-        plt.savefig(os.path.join(results_dir, "Disconnectivity_Graph.png"), dpi=600, bbox_inches='tight'); plt.close()
+        fig.savefig(os.path.join(results_dir, "Disconnectivity_Graph.png"), dpi=600, bbox_inches='tight')
+        plt.close(fig)
 
     logging.info(f"    -> Rendering Conformational Scatter with Directed Kinetic Flow...")
-    plt.figure(figsize=(12, 12))
+    fig, ax = plt.subplots(figsize=(12, 12))
     stride = max(1, len(pc1) // 50000) 
-    plt.scatter(pc1[::stride], pc2[::stride], s=1.0, color='black', alpha=0.3, zorder=1)
+    ax.scatter(pc1[::stride], pc2[::stride], s=1.0, color='black', alpha=0.3, zorder=1)
     max_dw = max(directed_transitions.values()) if directed_transitions else 1
     for (sA, sB), count in directed_transitions.items():
         if count >= 1: 
-            plt.annotate("", xy=(pos[sB][0], pos[sB][1]), xycoords='data', xytext=(pos[sA][0], pos[sA][1]), textcoords='data',
+            ax.annotate("", xy=(pos[sB][0], pos[sB][1]), xycoords='data', xytext=(pos[sA][0], pos[sA][1]), textcoords='data',
                          arrowprops=dict(arrowstyle="->", color="red", shrinkA=5, shrinkB=5, connectionstyle="arc3,rad=0.1", linewidth=(count / max_dw)*3.0 + 0.5, alpha=0.8), zorder=2)
     for state, (cx, cy) in pos.items():
-        plt.scatter(cx, cy, s=150, color='red', edgecolors='white', linewidths=1.5, zorder=3)
-        plt.text(cx, cy + 0.08, str(state), color='black', fontweight='bold', fontsize=10, ha='center', va='bottom', zorder=4, bbox=dict(facecolor='white', alpha=0.6, edgecolor='none', pad=0.5))
-    plt.axis('on'); plt.xlabel('Principal Component 1', fontsize=14, fontweight='bold'); plt.ylabel('Principal Component 2', fontsize=14, fontweight='bold')
-    plt.title(f"Raw Conformational Scatter & Kinetic Flow ({args.temp} K)", fontsize=16, fontweight='bold', pad=20)
-    plt.savefig(os.path.join(results_dir, "Scatter_Kinetic_Overlay.png"), dpi=600, bbox_inches='tight'); plt.close()
+        ax.scatter(cx, cy, s=150, color='red', edgecolors='white', linewidths=1.5, zorder=3)
+        ax.text(cx, cy + 0.08, str(state), color='black', fontweight='bold', fontsize=10, ha='center', va='bottom', zorder=4, bbox=dict(facecolor='white', alpha=0.6, edgecolor='none', pad=0.5))
+    ax.axis('on'); ax.set_xlabel('Principal Component 1', fontsize=14, fontweight='bold'); ax.set_ylabel('Principal Component 2', fontsize=14, fontweight='bold')
+    ax.set_title(f"Raw Conformational Scatter & Kinetic Flow ({args.temp} K)", fontsize=16, fontweight='bold', pad=20)
+    fig.savefig(os.path.join(results_dir, "Scatter_Kinetic_Overlay.png"), dpi=600, bbox_inches='tight')
+    plt.close(fig)
 
     logging.info(f"    -> Rendering Multidimensional Scaling (PCoA) of Cluster Centroids...")
     if num_states > 2:
@@ -572,17 +487,18 @@ def main():
         pcoa_coords = evecs[:, :2] * np.sqrt(np.maximum(evals[:2], 0))
         pos_pcoa = {state: (pcoa_coords[i, 0], pcoa_coords[i, 1]) for i, state in enumerate(states)}
         
-        plt.figure(figsize=(10, 10))
+        fig, ax = plt.subplots(figsize=(10, 10))
         for (sA, sB), count in directed_transitions.items():
             if count >= 1: 
-                plt.annotate("", xy=(pos_pcoa[sB][0], pos_pcoa[sB][1]), xycoords='data', xytext=(pos_pcoa[sA][0], pos_pcoa[sA][1]), textcoords='data',
+                ax.annotate("", xy=(pos_pcoa[sB][0], pos_pcoa[sB][1]), xycoords='data', xytext=(pos_pcoa[sA][0], pos_pcoa[sA][1]), textcoords='data',
                              arrowprops=dict(arrowstyle="->", color="red", shrinkA=8, shrinkB=8, linewidth=(count / max_dw)*3.0 + 0.5, alpha=0.8), zorder=1)
         for state, (cx, cy) in pos_pcoa.items():
-            plt.scatter(cx, cy, s=150, color='black', zorder=2)
-            plt.text(cx, cy + 0.05, str(state), color='black', fontweight='bold', fontsize=11, ha='center', va='bottom', zorder=3)
-        plt.axis('on'); plt.xlabel('1st PCoA Dimension', fontsize=14, fontweight='bold'); plt.ylabel('2nd PCoA Dimension', fontsize=14, fontweight='bold')
-        plt.title(f"Principal Coordinate Analysis of Cluster Centroids ({args.temp} K)", fontsize=16, fontweight='bold', pad=20)
-        plt.savefig(os.path.join(results_dir, "PCoA_Centroids_Graph.png"), dpi=600, bbox_inches='tight'); plt.close()
+            ax.scatter(cx, cy, s=150, color='black', zorder=2)
+            ax.text(cx, cy + 0.05, str(state), color='black', fontweight='bold', fontsize=11, ha='center', va='bottom', zorder=3)
+        ax.axis('on'); ax.set_xlabel('1st PCoA Dimension', fontsize=14, fontweight='bold'); ax.set_ylabel('2nd PCoA Dimension', fontsize=14, fontweight='bold')
+        ax.set_title(f"Principal Coordinate Analysis of Cluster Centroids ({args.temp} K)", fontsize=16, fontweight='bold', pad=20)
+        fig.savefig(os.path.join(results_dir, "PCoA_Centroids_Graph.png"), dpi=600, bbox_inches='tight')
+        plt.close(fig)
 
     timing_stats['plots'] = time.time() - t0_plots
 
@@ -604,7 +520,7 @@ def main():
     dcd_links, psf_links = [], []
     for f in os.listdir(search_link_dir):
         full_path = os.path.join(search_link_dir, f)
-        if os.path.islink(full_path):
+        if os.path.islink(full_path) and os.path.exists(full_path):
             if f.endswith('.dcd'): dcd_links.append(full_path)
             elif f.endswith('.psf'): psf_links.append(full_path)
 
@@ -614,7 +530,7 @@ def main():
     original_dcd = dcd_links[0] if dcd_links else next(iter([os.path.join(base_dir, f) for f in os.listdir(base_dir) if f.endswith('.dcd') and not f.startswith(('carma', 'cluster', 'transitions', 'dPCA'))]), None)
     original_psf = psf_links[0] if psf_links else next(iter([os.path.join(base_dir, f) for f in os.listdir(base_dir) if f.endswith('.psf') and not f.startswith(('carma', 'cluster', 'transitions', 'dPCA'))]), None)
 
-    if not original_dcd or not original_psf:
+    if not original_dcd or not os.path.exists(original_dcd) or not original_psf or not os.path.exists(original_psf):
         logging.warning(f"{Colors.YELLOW}[-]{Colors.RESET} Warning: Missing fundamental trajectory (.dcd) or topology (.psf) files in {base_dir}. Bypassing extraction phase.")
     else:
         logging.info(f"{Colors.BLUE}[+]{Colors.RESET} Trajectory file acquired: {original_dcd}")
@@ -623,10 +539,14 @@ def main():
         total_clusters = len(unique_clusters)
         fh = logging.getLogger().handlers[1]
         
+        abs_original_dcd = os.path.abspath(original_dcd)
+        abs_original_psf = os.path.abspath(original_psf)
+        abs_results_dir = os.path.abspath(results_dir)
+        
         for i, cid in enumerate(unique_clusters):
             
             total_str = f"({i+1:4d}/{total_clusters:4d})"
-            sys.stdout.write(f"\r    -> Cluster {cid:4d} {total_str} : Processing structural core...       ")
+            sys.stdout.write(f"\r    -> Cluster {cid:4d} {total_str} : Processing structural core...        ")
             sys.stdout.flush()
             fh.stream.write(f"    -> Processing Structural Core: Cluster {cid:4d}...\n")
             fh.flush()
@@ -642,87 +562,138 @@ def main():
             medoid_frame = cluster_frames[medoid_idx_zero]
             medoid_idx_carma = medoid_idx_zero + 1  
             
-            if args.rmsd > 0.0:
-                fh.stream.write(f"      -> Executing Real 3D RMSD Filter (Threshold: {args.rmsd} A)...\n")
-                fh.flush()
-                temp_full_dcd = f"temp_full_{cid:04d}.dcd"
-                np.savetxt("temp_frames.dat", cluster_frames, fmt='%d')
-                run_and_log_carma(["carma", "-v", "-sort", "temp_frames.dat", original_dcd])
-                if os.path.exists("carma.reordered.dcd"): os.rename("carma.reordered.dcd", temp_full_dcd)
-                run_and_log_carma(["carma", "-v", "-fit", "-reference", str(medoid_idx_carma)] + extraction_flags + [temp_full_dcd, original_psf])
-                if os.path.exists("carma.fit-rms.dat"):
-                    try:
-                        rmsd_data = np.loadtxt("carma.fit-rms.dat")
-                        core_mask = rmsd_data[:, 1] <= args.rmsd
-                        retained_count = np.sum(core_mask)
-                        if retained_count > 0:
-                            cluster_frames = cluster_frames[core_mask]
-                            fh.stream.write(f"      -> Filter applied successfully: Retained {retained_count}/{initial_frame_count} rigid structural frames.\n")
-                            msg = f"Retained {retained_count}/{initial_frame_count} frames."
-                            sys.stdout.write(f"\r    -> Cluster {cid:4d} {total_str} : {msg:<34}\n")
-                        else:
-                            msg = f"[WARNING] 0 frames passed filter."
-                            sys.stdout.write(f"\r    {Colors.YELLOW}-> Cluster {cid:4d} {total_str} : {msg:<34}{Colors.RESET}\n")
-                        sys.stdout.flush()
-                    except Exception as e: 
-                        logging.warning(f"\n      {Colors.YELLOW}[-]{Colors.RESET} Warning: RMSD evaluation failed ({e}).")
-                for f in glob.glob("carma.*") + [temp_full_dcd, "temp_frames.dat"]:
-                    try: os.remove(f)
-                    except OSError: pass
-            else:
-                fh.stream.write(f"      -> Extraction Success: Retained {initial_frame_count}/{initial_frame_count} frames (3D Filter inactive).\n")
-                msg = f"Extracted {initial_frame_count} frames."
-                sys.stdout.write(f"\r    -> Cluster {cid:4d} {total_str} : {msg:<34}\n")
-                sys.stdout.flush()
-
-            frame_list_file = f"temp_frames_cluster_{cid:04d}.dat"
-            np.savetxt(frame_list_file, cluster_frames, fmt='%d')
-            t_sub = time.time()
-            run_and_log_carma(["carma", "-v", "-sort", frame_list_file, original_dcd])
-            carma_stats['sort'] += (time.time() - t_sub)
-            final_dcd_name = os.path.join(results_dir, f"cluster_{cid:04d}.dcd")
-            if os.path.exists("carma.reordered.dcd"): os.rename("carma.reordered.dcd", final_dcd_name)
+            with tempfile.TemporaryDirectory(dir=abs_results_dir) as tmp_dir:
                 
-            t_sub = time.time()
-            new_medoid_idx_carma = np.where(cluster_frames == medoid_frame)[0][0] + 1
-            run_and_log_carma(["carma", "-v", "-fit", "-reference", str(new_medoid_idx_carma)] + extraction_flags + [final_dcd_name, original_psf])
-            carma_stats['rmsd'] += (time.time() - t_sub)
-            cluster_rmsds[cid] = -1.0
-            if os.path.exists("carma.fit-rms.dat"):
-                try: 
-                    cluster_rmsds[cid] = float(np.max(np.loadtxt("carma.fit-rms.dat")[:, 1]))
-                except Exception as e: 
-                    logging.warning(f"\n      {Colors.YELLOW}[-]{Colors.RESET} Warning: Failed to extract max RMSD for Cluster {cid} ({e}).")
-                os.remove("carma.fit-rms.dat")
-            
-            t_sub = time.time()
-            run_and_log_carma(["carma", "-v", "-w", "-cov", "-dot", "-super"] + extraction_flags + [final_dcd_name, original_psf])
-            carma_stats['super'] += (time.time() - t_sub)
-            if os.path.exists("carma.superposition.pdb"): os.rename("carma.superposition.pdb", os.path.join(results_dir, f"cluster_{cid:04d}_superposition.pdb"))
-            if os.path.exists("carma.average.pdb"): os.remove("carma.average.pdb")
-            
-            t_sub = time.time()
-            run_and_log_carma(["carma", "-v", "-first", str(medoid_frame), "-last", str(medoid_frame), "-pdb"] + extraction_flags + [original_dcd, original_psf])
-            carma_stats['sort'] += (time.time() - t_sub)
-            extracted_pdbs = [f for f in glob.glob("*.pdb") if "superposition" not in f and "average" not in f and "cluster_" not in f]
-            if extracted_pdbs:
-                os.rename(extracted_pdbs[0], os.path.join(results_dir, f"cluster_{cid:04d}_medoid.pdb"))
-                for extra_pdb in extracted_pdbs[1:]: os.remove(extra_pdb)
-            for f in glob.glob("*varcov*") + glob.glob("carma.*") + glob.glob("*.rmsdev.ps") + glob.glob("*.averag.ps") + [frame_list_file]:
-                try: os.remove(f)
-                except OSError: pass
+                temp_frames_dat = os.path.join(tmp_dir, "temp_frames.dat")
+                np.savetxt(temp_frames_dat, cluster_frames, fmt='%d')
+                
+                t_sub = time.time()
+                run_and_log_carma(["carma", "-v", "-sort", "temp_frames.dat", abs_original_dcd], run_dir=tmp_dir)
+                carma_stats['sort'] += (time.time() - t_sub)
+                
+                temp_full_dcd = os.path.join(tmp_dir, "temp_full.dcd")
+                if os.path.exists(os.path.join(tmp_dir, "carma.reordered.dcd")):
+                    os.rename(os.path.join(tmp_dir, "carma.reordered.dcd"), temp_full_dcd)
+                else:
+                    logging.error(f"Failed to extract cluster {cid} frames.")
+                    continue
+                
+                fh.stream.write(f"      -> Phase 1: Pre-fitting cluster to PCA medoid...\n")
+                t_sub = time.time()
+                run_and_log_carma(["carma", "-v", "-w", "-cov"] + extraction_flags + [temp_full_dcd, abs_original_psf], run_dir=tmp_dir)
+                run_and_log_carma(["carma", "-v", "-w", "-fit", "-reference", str(medoid_idx_carma)] + extraction_flags + [temp_full_dcd, abs_original_psf], run_dir=tmp_dir)
+                carma_stats['rmsd'] += (time.time() - t_sub)
+                
+                temp_fitted_dcd = os.path.join(tmp_dir, "carma.fitted.dcd")
+                if os.path.exists(os.path.join(tmp_dir, "carma.fitted.dcd")):
+                    os.rename(os.path.join(tmp_dir, "carma.fitted.dcd"), temp_fitted_dcd)
+                else:
+                    temp_fitted_dcd = temp_full_dcd 
+                
+                pseudo_psf = os.path.join(tmp_dir, "carma.selected_atoms.psf")
+                safe_psf = os.path.join(tmp_dir, "cluster.psf")
+                if os.path.exists(pseudo_psf):
+                    os.rename(pseudo_psf, safe_psf)
+                else:
+                    safe_psf = abs_original_psf
+
+                fh.stream.write(f"      -> Phase 2: Calculating mathematical average & superposition...\n")
+                t_sub = time.time()
+                run_and_log_carma(["carma", "-v", "-cov", "-dot", "-super"] + extraction_flags + [temp_fitted_dcd, safe_psf], run_dir=tmp_dir)
+                carma_stats['super'] += (time.time() - t_sub)
+                
+                super_pdb = os.path.join(tmp_dir, "carma.superposition.pdb")
+                if os.path.exists(super_pdb):
+                    os.rename(super_pdb, os.path.join(abs_results_dir, f"cluster_{cid:04d}_superposition.pdb"))
+                avg_pdb = os.path.join(tmp_dir, "carma.average.pdb")
+                if os.path.exists(avg_pdb):
+                    os.rename(avg_pdb, os.path.join(abs_results_dir, f"cluster_{cid:04d}_average.pdb"))
+                
+                rms_average_dat = os.path.join(tmp_dir, "carma.rms-average.dat")
+                cluster_rmsds[cid] = -1.0
+                
+                if os.path.exists(rms_average_dat):
+                    try:
+                        rmsd_data = np.loadtxt(rms_average_dat)
+                        if rmsd_data.ndim == 1:
+                            rmsd_data = rmsd_data.reshape(-1, 2)
+                        rmsd_values = rmsd_data[:, 1]
+                        cluster_rmsds[cid] = float(np.max(rmsd_values))
+                        
+                        if args.rmsd > 0.0:
+                            fh.stream.write(f"      -> Phase 3: Executing RMSD Filter from Average (Threshold: {args.rmsd} A)...\n")
+                            fh.flush()
+                            core_mask = rmsd_values <= args.rmsd
+                            retained_count = np.sum(core_mask)
+                            
+                            if retained_count > 0:
+                                core_cluster_frames = cluster_frames[core_mask]
+                                fh.stream.write(f"      -> Filter applied successfully: Retained {retained_count}/{initial_frame_count} core frames.\n")
+                                sys.stdout.write(f"\r    -> Cluster {cid:4d} {total_str} : Retained {retained_count}/{initial_frame_count} core frames.        \n")
+                                
+                                np.savetxt(temp_frames_dat, core_cluster_frames, fmt='%d')
+                                t_sub = time.time()
+                                run_and_log_carma(["carma", "-v", "-sort", "temp_frames.dat", abs_original_dcd], run_dir=tmp_dir)
+                                carma_stats['sort'] += (time.time() - t_sub)
+                                
+                                if os.path.exists(os.path.join(tmp_dir, "carma.reordered.dcd")):
+                                    core_dcd_path = os.path.join(abs_results_dir, f"cluster_{cid:04d}_core.dcd")
+                                    os.rename(os.path.join(tmp_dir, "carma.reordered.dcd"), core_dcd_path)
+                                    
+                                    core_fitted = os.path.join(tmp_dir, "core_fitted.dcd")
+                                    run_and_log_carma(["carma", "-v", "-w", "-fit", "-reference", "1"] + extraction_flags + [core_dcd_path, abs_original_psf], run_dir=tmp_dir)
+                                    if os.path.exists(os.path.join(tmp_dir, "carma.fitted.dcd")):
+                                        os.rename(os.path.join(tmp_dir, "carma.fitted.dcd"), core_fitted)
+                                    else:
+                                        core_fitted = core_dcd_path
+                                        
+                                    run_and_log_carma(["carma", "-v", "-cov", "-dot", "-super"] + extraction_flags + [core_fitted, safe_psf], run_dir=tmp_dir)
+                                    
+                                    if os.path.exists(os.path.join(tmp_dir, "carma.superposition.pdb")):
+                                        os.rename(os.path.join(tmp_dir, "carma.superposition.pdb"), os.path.join(abs_results_dir, f"cluster_{cid:04d}_superposition.pdb"))
+                                    if os.path.exists(os.path.join(tmp_dir, "carma.average.pdb")):
+                                        os.rename(os.path.join(tmp_dir, "carma.average.pdb"), os.path.join(abs_results_dir, f"cluster_{cid:04d}_average.pdb"))
+                                        
+                                    rms_core_dat = os.path.join(tmp_dir, "carma.rms-average.dat")
+                                    if os.path.exists(rms_core_dat):
+                                        c_rmsd = np.loadtxt(rms_core_dat)
+                                        if c_rmsd.ndim == 1: c_rmsd = c_rmsd.reshape(-1, 2)
+                                        cluster_rmsds[cid] = float(np.max(c_rmsd[:, 1]))
+                                
+                                cluster_frames = core_cluster_frames
+                            else:
+                                sys.stdout.write(f"\r    -> Cluster {cid:4d} {total_str} : [WARNING] 0 frames passed filter.          \n")
+                                logging.warning(f"\n      {Colors.YELLOW}[-]{Colors.RESET} Warning: Zero frames satisfy threshold for Cluster {cid}. Retaining complete ensemble.")
+                                shutil.copy(temp_fitted_dcd, os.path.join(abs_results_dir, f"cluster_{cid:04d}.dcd"))
+                        else:
+                            sys.stdout.write(f"\r    -> Cluster {cid:4d} {total_str} : Extracted {initial_frame_count} frames.                 \n")
+                            shutil.copy(temp_fitted_dcd, os.path.join(abs_results_dir, f"cluster_{cid:04d}.dcd"))
+                    except Exception as e:
+                        logging.warning(f"\n      {Colors.YELLOW}[-]{Colors.RESET} Warning: Core RMSD evaluation failed ({e}) for Cluster {cid}. Retaining complete ensemble.")
+                        shutil.copy(temp_fitted_dcd, os.path.join(abs_results_dir, f"cluster_{cid:04d}.dcd"))
+                else:
+                    sys.stdout.write(f"\r    -> Cluster {cid:4d} {total_str} : Extracted {initial_frame_count} frames (No RMSD log).       \n")
+                    shutil.copy(temp_fitted_dcd, os.path.join(abs_results_dir, f"cluster_{cid:04d}.dcd"))
+                
+                run_and_log_carma(["carma", "-v", "-first", str(medoid_frame), "-last", str(medoid_frame), "-pdb"] + extraction_flags + [abs_original_dcd, abs_original_psf], run_dir=tmp_dir)
+                extracted_pdbs = [f for f in glob.glob(os.path.join(tmp_dir, "*.pdb")) if "superposition" not in f and "average" not in f]
+                if extracted_pdbs:
+                    os.rename(extracted_pdbs[0], os.path.join(abs_results_dir, f"cluster_{cid:04d}_medoid.pdb"))
+                
+                sys.stdout.flush()
+                fh.flush()
 
         logging.info(f"    {Colors.BLUE}[*]{Colors.RESET} Processing transition cluster (Cluster -1)...\n")
         noise_mask = (labels == -1)
         if np.any(noise_mask):
-            noise_file = "temp_frames_noise.dat"
-            np.savetxt(noise_file, frames[noise_mask], fmt='%d')
-            t_sub = time.time()
-            run_and_log_carma(["carma", "-v", "-sort", noise_file, original_dcd])
-            carma_stats['sort'] += (time.time() - t_sub)
-            if os.path.exists("carma.reordered.dcd"): os.rename("carma.reordered.dcd", os.path.join(results_dir, "transitions_noise.dcd"))
-            try: os.remove(noise_file)
-            except OSError: pass
+            with tempfile.TemporaryDirectory(dir=abs_results_dir) as tmp_dir:
+                noise_file = os.path.join(tmp_dir, "temp_frames_noise.dat")
+                np.savetxt(noise_file, frames[noise_mask], fmt='%d')
+                t_sub = time.time()
+                run_and_log_carma(["carma", "-v", "-sort", "temp_frames_noise.dat", abs_original_dcd], run_dir=tmp_dir)
+                carma_stats['sort'] += (time.time() - t_sub)
+                if os.path.exists(os.path.join(tmp_dir, "carma.reordered.dcd")): 
+                    os.rename(os.path.join(tmp_dir, "carma.reordered.dcd"), os.path.join(abs_results_dir, "transitions_noise.dcd"))
 
         logging.info(f"{Colors.BLUE}[+]{Colors.RESET} Structural extraction complete. Trajectories and representative structures exported.")
     timing_stats['extract'] = time.time() - t0_extract
@@ -742,9 +713,12 @@ def main():
         report.write(f"Frame Stride           : {args.step}\n")
         report.write(f"Dimensionality Subspace: {n_dimensions} (Capturing {variance_str} of structural variance)\n")
         report.write(f"Clustering Methodology : {args.method}\n")
-        report.write(f"Auto-Scaling           : {'Active (Sub-linear scaling)' if args.auto else 'Inactive (Manual)'}\n")
+        
+        auto_status = "Active (Sub-linear scaling)" if args.auto else "Inactive (Manual)"
+        report.write(f"Auto-Scaling           : {auto_status}\n")
         report.write(f"Minimum Cluster Volume : {dynamic_size} frames\n")
         report.write(f"Minimum Density Samples: {dynamic_samples} frames\n")
+        
         report.write(f"Structural Core Filter : {'Active' if args.rmsd > 0 else 'Inactive'}\n")
         report.write(f"Simulation Temp        : {args.temp} K\n")
         report.write(f"Target SegID           : {args.segid if args.segid else 'ALL'}\n\n")
@@ -752,15 +726,17 @@ def main():
         report.write(f"Logical Cores Utilized : {cpu_cores}\n")
         report.write(f"Peak Memory Allocation : {peak_ram_gb:.2f} GB\n")
         report.write(f"Total Pipeline Runtime : {format_time(total_pipeline_time)}\n\n")
+        
         report.write("[ Execution Breakdown ]\n")
-        report.write(f"  Data Ingestion (I/O) : {format_time(timing_stats.get('load', 0))}\n")
-        report.write(f"  HDBSCAN Algorithm    : {format_time(timing_stats.get('hdbscan', 0))}\n")
-        report.write(f"  Coordinate Export    : {format_time(timing_stats.get('export', 0))}\n")
-        report.write(f"  Graphical Rendering  : {format_time(timing_stats.get('plots', 0))}\n")
-        report.write(f"  CARMA Processing     : {format_time(timing_stats.get('extract', 0))}\n")
-        report.write(f"    ├── Extraction     : {format_time(carma_stats.get('sort', 0))}\n")
-        report.write(f"    ├── RMSD Alignment : {format_time(carma_stats.get('rmsd', 0))}\n")
-        report.write(f"    └── Superposition  : {format_time(carma_stats.get('super', 0))}\n\n")
+        report.write(f"  Data Ingestion (I/O) : {timing_stats.get('load', 0):7.2f} s\n")
+        report.write(f"  HDBSCAN Algorithm    : {timing_stats.get('hdbscan', 0):7.2f} s\n")
+        report.write(f"  Coordinate Export    : {timing_stats.get('export', 0):7.2f} s\n")
+        report.write(f"  FES Visualization    : {timing_stats.get('plots', 0):7.2f} s\n")
+        report.write(f"  CARMA Processing     : {timing_stats.get('extract', 0):7.2f} s\n")
+        report.write(f"    ├── Extraction     : {carma_stats.get('sort', 0):7.2f} s\n")
+        report.write(f"    ├── RMSD Alignment : {carma_stats.get('rmsd', 0):7.2f} s\n")
+        report.write(f"    └── Superposition  : {carma_stats.get('super', 0):7.2f} s\n\n")
+        
         report.write("--- THERMODYNAMIC POPULATIONS ---\n") 
         for cid in unique_clusters:
             count = np.sum(labels == cid)
@@ -768,12 +744,90 @@ def main():
             rmsd_str = f"{cluster_rmsds.get(cid, -1.0):.2f} A" if cluster_rmsds.get(cid, -1.0) >= 0 else "N/A"
             report.write(f"  Cluster {cid:4d} : {count:7d} frames ({percentage:5.1f}%) | Max Internal RMSD: {rmsd_str}\n")
         report.write("==================================================\n")
-    
     logging.info(f"{Colors.BLUE}[+]{Colors.RESET} Execution report successfully generated: {report_filename}")
     logging.info(f"\n{Colors.BOLD}=== Pipeline Execution Terminated Successfully ({format_time(total_pipeline_time)}). Data archived in {results_dir}/ ==={Colors.RESET}")
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Automated HDBSCAN clustering, kinetic networks, and structural extraction pipeline.")
+    parser.add_argument('--size', type=int, default=500, help='Explicit minimum cluster size parameter (Default: 500)')
+    parser.add_argument('--samples', type=int, default=50, help='Explicit minimum samples parameter (Default: 50)')
+    parser.add_argument('--auto', action='store_true', help='Autoscale size and samples based on frame count')
+    parser.add_argument('--method', type=str, default='eom', choices=['eom', 'leaf'], help='Cluster selection methodology (Default: eom)')
+    parser.add_argument('--dim', type=int, default=0, help='Dimensionality subspace for analysis (0 = All available PCs)')
+    parser.add_argument('--rmsd', type=float, default=0.0, help='Real 3D RMSD cutoff (A) for core extraction. Exceeding frames are discarded. (0 = Disabled)')
+    parser.add_argument('--temp', type=float, default=298.0, help='Simulation temperature in Kelvin for Free Energy conversion (Default: 298.0)')
+    parser.add_argument('--step', type=int, default=1, help='Frame stride for memory management on massive trajectories (Default: 1)')
+    parser.add_argument('--segid', type=str, default=None, help='Target specific segment identifier for structural extraction (e.g., A)')
+    parser.add_argument('--min-jumps', type=int, default=3, help="Minimum transition events required to draw an edge (Default: 3)")
+    parser.add_argument('--transitions', nargs='*', type=int, help="Pass 0 args to view top jumps, or 2 args to validate a specific physical edge.")
+    parser.add_argument('--top', type=int, default=15, help="Number of top transitions to display in the diagnostic table (Default: 15)")
+    parser.add_argument('--events', type=int, default=3, help="Max raw transition events to print in diagnostic mode (Default: 3)")
+
+    args = parser.parse_args()
+
+    if args.transitions is not None and len(args.transitions) not in [0, 2]:
+        parser.error("--transitions requires either 0 arguments (to view top jumps) or 2 arguments (to validate a specific edge).")
+
+    clustering_flags = ['--size', '--samples', '--auto', '--method', '--dim', '--rmsd', '--step', '--segid']
+    is_full_pipeline = True
+
+    if args.transitions is not None:
+        passed_clustering_flags = [flag for flag in clustering_flags if flag in sys.argv]
+        if not passed_clustering_flags:
+            is_full_pipeline = False
+
+    logging.basicConfig(level=logging.INFO, format='%(message)s', handlers=[logging.StreamHandler(sys.stdout)])
+
+    if not shutil.which("carma"):
+        logging.error(f"{Colors.RED}[-]{Colors.RESET} Critical Error: 'carma' binary not found in system $PATH.")
+        logging.error(f"{Colors.YELLOW}[*]{Colors.RESET} Please ensure CARMA is installed and accessible before running this pipeline.")
+        sys.exit(1)
+
     if is_full_pipeline:
-        main()
+        logging.info(f"{Colors.BOLD}=== Initializing HDBSCAN & Kinetic Clustering Pipeline ==={Colors.RESET}")
+        logging.info(f"{Colors.LIGHT_BLUE}[*]{Colors.RESET} Locating fluctuations file...")
+        
+        fluctuation_files = glob.glob('*fluctuations.dat') or glob.glob('carma_results*/*fluctuations.dat') or glob.glob('../carma_results*/*fluctuations.dat')
+
+        if not fluctuation_files:
+            logging.error(f"{Colors.RED}[-]{Colors.RESET} Critical Error: '*fluctuations.dat' not found in current directory, or any 'carma_results*' subdirectories/parent directories.")
+            logging.error(f"{Colors.RED}[-]{Colors.RESET} Execution terminated before loading scientific libraries.")
+            sys.exit(1)
+
+        if len(fluctuation_files) > 1:
+            logging.warning(f"{Colors.YELLOW}[-]{Colors.RESET} Multiple fluctuation files found. Selecting the most recently modified.")
+        data_file = max(fluctuation_files, key=os.path.getmtime)
+        
+        logging.info(f"{Colors.BLUE}[+]{Colors.RESET} Input file acquired: {data_file}")
+
+        target_analysis_dir = os.path.dirname(data_file)
+        if not target_analysis_dir: target_analysis_dir = '.'
+        logging.info(f"{Colors.LIGHT_BLUE}[*]{Colors.RESET} Targeted Analysis Directory: {target_analysis_dir}")
+
+        timestamp = datetime.datetime.now().strftime("%d.%m.%Y_%H.%M.%S")
+        results_dir = f"clusterMD_results_{timestamp}"
+        os.makedirs(results_dir, exist_ok=True)
+
+        file_handler = logging.FileHandler(os.path.join(results_dir, "clustering_execution.log"))
+        file_handler.setFormatter(logging.Formatter('%(message)s'))
+        logging.getLogger().addHandler(file_handler)
+        logging.info(f"{Colors.LIGHT_BLUE}[*]{Colors.RESET} Output directory established: {results_dir}")
+        
+        main(data_file, args, results_dir, target_analysis_dir)
+
     else:
-        run_validation()
+        logging.info(f"{Colors.BOLD}=== Initializing Post-Run Transition Validation ==={Colors.RESET}")
+        dat_files = glob.glob("hdbscan.*-D.clusters.dat")
+        
+        if not dat_files:
+            logging.error(f"\n{Colors.RED}[-]{Colors.RESET} Critical Error: 'hdbscan.*-D.clusters.dat' not found in the current directory.")
+            logging.error(f"{Colors.YELLOW}[*]{Colors.RESET} You are running clusterMD in Diagnostic Mode without full pipeline flags.")
+            logging.error(f"{Colors.YELLOW}[*]{Colors.RESET} Please navigate INSIDE a 'clusterMD_results_*' folder to run this command.")
+            sys.exit(1)
+            
+        if len(dat_files) > 1:
+            logging.warning(f"{Colors.YELLOW}[-]{Colors.RESET} Multiple cluster dat files found. Selecting the most recently modified.")
+        dat_file = max(dat_files, key=os.path.getmtime)
+        
+        logging.info(f"{Colors.LIGHT_BLUE}[*]{Colors.RESET} Target data located: {os.path.abspath(dat_file)}")
+        run_validation(dat_file, args)
