@@ -643,7 +643,10 @@ def run_full_pipeline(args, data_file, results_dir, target_analysis_dir):
     # 2. CLUSTERING
     logging.info(f"\n{Colors.LIGHT_BLUE}[*]{Colors.RESET} Executing HDBSCAN clustering (Method: {args.method})...")
     labels, timing_stats['hdbscan'] = execute_clustering_algorithm(data_nd, dynamic_size, dynamic_samples, args.method)
-    logging.info(f"{Colors.BLUE}[+]{Colors.RESET} Isolated distinct clusters in {timing_stats['hdbscan']:.2f} seconds.")
+    
+    # Inline calculation to restore the exact terminal output
+    initial_cluster_count = len(np.unique(labels[labels != -1]))
+    logging.info(f"{Colors.BLUE}[+]{Colors.RESET} Isolated {initial_cluster_count} distinct clusters in {timing_stats['hdbscan']:.2f} seconds.")
     
     logging.info(f"{Colors.LIGHT_BLUE}[*]{Colors.RESET} Sorting cluster assignments by descending population size...")
     labels, unique_clusters = sort_cluster_populations(labels)
