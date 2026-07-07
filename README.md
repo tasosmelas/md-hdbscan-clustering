@@ -7,6 +7,8 @@ The goal of this project is to provide a Python script that:
 3. **Structural Extraction**: Automatically extracts physical **Medoid** structures and **Superposition** ensembles for every identified state.
 4. **Transition Plots**: *(Work in Progress)* Generates transition graphs between clusters to visualize folding and unfolding pathways.
 
+<img width="1228" height="819" alt="clusterMD_infographic" src="https://github.com/user-attachments/assets/b327daec-58fe-444b-b368-f1164904305f" />
+
 ## Prerequisites
 Before running this pipeline, ensure your system has the following installed:
 * **Python 3.8+**
