@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Automating the multidimensional density-based clustering of data derived from a 
-Principal Component Analysis of molecular dynamics trajectories using fast-hdbscan.
+Automating multidimensional density-based clustering and structural analysis of molecular dynamics trajectories using fast-hdbscan.
 """
 
 import os
@@ -59,6 +58,10 @@ def format_record(raw_line, frame_val, cid_val):
 # =========================================================================
 def ingest_trajectory_data(file_path, step=1):
     """Reads the file dynamically to prevent OOM errors on massive trajectories using a single I/O pass."""
+    if os.path.getsize(file_path) == 0:
+        logging.error(f"{Colors.RED}[-]{Colors.RESET} Critical Error: Coordinate file is empty.")
+        sys.exit(1)
+
     logging.info(f"{Colors.LIGHT_BLUE}[*]{Colors.RESET} Pre-allocating memory and loading data (Stride: {step})...")
     
     try:
@@ -82,10 +85,23 @@ def ingest_trajectory_data(file_path, step=1):
                 parts = line.split()
                 if parts:
                     if len(parts) == num_cols:
-                        data[idx] = [float(x) for x in parts]
-                        idx += 1
+                        try:
+                            frame_val = float(parts[0])
+                            if not frame_val.is_integer() or frame_val <= 0:
+                                logging.error(f"{Colors.RED}[-]{Colors.RESET} Critical Error: Frame IDs must be positive integers. Found '{parts[0]}' at line {i+1}.")
+                                sys.exit(1)
+                            
+                            row_vals = [float(x) for x in parts]
+                            if not all(math.isfinite(x) for x in row_vals):
+                                logging.error(f"{Colors.RED}[-]{Colors.RESET} Critical Error: Non-finite value (NaN/Inf) detected at line {i+1}. Analysis aborted.")
+                                sys.exit(1)
+                                
+                            data[idx] = row_vals
+                            idx += 1
+                        except ValueError:
+                            logging.warning(f"{Colors.YELLOW}[-]{Colors.RESET} Format anomaly at line {i+1}: non-numeric data. Row skipped.")
                     else:
-                        logging.warning(f"{Colors.YELLOW}[-]{Colors.RESET} Format anomaly at line {i}: expected {num_cols} cols, found {len(parts)}. Frame skipped.")
+                        logging.warning(f"{Colors.YELLOW}[-]{Colors.RESET} Format anomaly at line {i+1}: expected {num_cols} cols, found {len(parts)}. Frame skipped.")
                         
     return data[:idx]
 
@@ -125,7 +141,7 @@ def export_cluster_coordinates(frames, labels, data_nd, out_file, n_dimensions):
 
 
 # =========================================================================
-# 4. TRANSITIONS (Thermodynamics & Kinetic Networks)
+# 4. TRANSITIONS (Population-derived Free Energy & Observed Label Changes)
 # =========================================================================
 def calculate_thermodynamic_energies(labels, temp):
     """Computes populations and relative free energies (kcal/mol)."""
@@ -154,19 +170,19 @@ def map_kinetic_pathways(labels):
     return transitions, directed_transitions
 
 def print_top_transition_jumps(transitions, top_n):
-    """Outputs the most frequent physical transitions."""
-    logging.info(f"\n{Colors.BLUE}[+]{Colors.RESET} Total Unique Transition Pathways Discovered: {len(transitions)}")
-    logging.info(f"{Colors.BLUE}[+]{Colors.RESET} Top {top_n} Most Frequent Transitions:")
-    logging.info(f"    {'Edge (A <-> B)':<20} | {'Jump Count':<10}")
+    """Outputs the most frequent observed transitions between assigned cluster labels."""
+    logging.info(f"\n{Colors.BLUE}[+]{Colors.RESET} Unique observed cluster-to-cluster pathways: {len(transitions)}")
+    logging.info(f"{Colors.BLUE}[+]{Colors.RESET} Top {top_n} observed label transitions:")
+    logging.info(f"    {'Cluster pair':<20} | {'Observed changes':<16}")
     logging.info("    " + "-"*35)
     sorted_transitions = sorted(transitions.items(), key=lambda item: item[1], reverse=True)
     for edge, count in sorted_transitions[:top_n]:
-        logging.info(f"    Edge {edge[0]:4d} <--> {edge[1]:4d}      | {count:5d} jumps")
+        logging.info(f"    {edge[0]:4d} <--> {edge[1]:4d}          | {count:5d}")
     return sorted_transitions
 
 def hunt_chronological_jump_events(target_edge, labels, frames, data_nd, max_events):
-    """Hunts for precise chronologies of frame-by-frame structural jumps."""
-    logging.info(f"\n{Colors.LIGHT_BLUE}[*]{Colors.RESET} Hunting for chronological events for Edge {target_edge} in RAM...")
+    """Inspects the chronology of observed changes between assigned cluster labels."""
+    logging.info(f"\n{Colors.LIGHT_BLUE}[*]{Colors.RESET} Inspecting chronological transition events for cluster pair {target_edge}...")
     events_found = 0
     last_valid_state, last_valid_idx = None, None
     current_fog_indices = []
@@ -178,12 +194,12 @@ def hunt_chronological_jump_events(target_edge, labels, frames, data_nd, max_eve
                 if current_edge == target_edge:
                     events_found += 1
                     if events_found <= max_events:
-                        logging.info(f"\n{Colors.LIGHT_BLUE}--- Transition Event {events_found} ---{Colors.RESET}")
+                        logging.info(f"\n{Colors.LIGHT_BLUE}--- Observed Transition Event {events_found} ---{Colors.RESET}")
                         logging.info(f"LEAVING  : {format_record(data_nd[last_valid_idx], frames[last_valid_idx], last_valid_state)}")
                         if current_fog_indices:
-                            logging.info(f"  ... [ {len(current_fog_indices)} frames of transition fog (-1) ] ...")
-                            for f_idx in current_fog_indices[:2]: logging.info(f"  FOG    : {format_record(data_nd[f_idx], frames[f_idx], -1)}")
-                            if len(current_fog_indices) > 2: logging.info("  ...      (additional fog frames hidden to save space)")
+                            logging.info(f"  ... [ {len(current_fog_indices)} intervening unassigned/noise frames (-1) ] ...")
+                            for f_idx in current_fog_indices[:2]: logging.info(f"  UNASSIGNED: {format_record(data_nd[f_idx], frames[f_idx], -1)}")
+                            if len(current_fog_indices) > 2: logging.info("  ...      (additional unassigned/noise frames hidden to save space)")
                         logging.info(f"ARRIVING : {format_record(data_nd[idx], frames[idx], label)}")
             last_valid_state, last_valid_idx = label, idx
             current_fog_indices = []
@@ -191,9 +207,9 @@ def hunt_chronological_jump_events(target_edge, labels, frames, data_nd, max_eve
             if last_valid_state is not None: current_fog_indices.append(idx)
             
     if events_found == 0:
-        logging.error(f"{Colors.YELLOW}[-]{Colors.RESET} WARNING: No direct jumps found between Cluster {target_edge[0]} and Cluster {target_edge[1]}.")
+        logging.error(f"{Colors.YELLOW}[-]{Colors.RESET} WARNING: No observed label changes found between Cluster {target_edge[0]} and Cluster {target_edge[1]}.")
     elif events_found > max_events:
-        logging.info(f"\n{Colors.BLUE}[+]{Colors.RESET} ... and {events_found - max_events} more identical transition events hidden.")
+        logging.info(f"\n{Colors.BLUE}[+]{Colors.RESET} ... and {events_found - max_events} additional events hidden.")
     logging.info("="*85 + "\n")
 
 
@@ -204,7 +220,7 @@ def render_conformational_landscape(x, y, lx, ly, p1, p2, unique_clusters, label
     import matplotlib.pyplot as plt
     cmap = plt.get_cmap('turbo')
     fig, ax = plt.subplots(figsize=(12, 10)) 
-    ax.scatter(x, y, color='lightgrey', s=0.5, alpha=0.5, label='Transition States')
+    ax.scatter(x, y, color='lightgrey', s=0.5, alpha=0.5, label='Unassigned / noise')
     for i, cid in enumerate(unique_clusters):
         mask = (labels == cid)
         cluster_color = cmap(i / max(1, (len(unique_clusters) - 1)))
@@ -262,7 +278,7 @@ def render_kinetic_network(states, free_energies, population_map, transitions, m
     ax.axis('on'); ax.grid(True, linestyle='--', alpha=0.3)
     ax.set_xlabel('Principal Component 1', fontsize=14, fontweight='bold')
     ax.set_ylabel('Principal Component 2', fontsize=14, fontweight='bold')
-    ax.set_title(f"Kinetic Transition Network Map ({temp} K)\nNodes = PC1/PC2 Centroids | Edges = Physical Jumps", fontsize=16, fontweight='bold', pad=20)
+    ax.set_title(f"Observed Transition Network ({temp} K)\nNodes = median PC1/PC2 positions | Edges = observed label changes", fontsize=16, fontweight='bold', pad=20)
     fig.savefig(out_file, dpi=PLOT_DPI, bbox_inches='tight')
     plt.close(fig)
     return pos
@@ -327,7 +343,7 @@ def render_kinetic_flow_scatter(pc1, pc2, directed_transitions, pos, temp, out_f
         ax.scatter(cx, cy, s=150, color='red', edgecolors='white', linewidths=1.5, zorder=3)
         ax.text(cx, cy + 0.08, str(state), color='black', fontweight='bold', fontsize=10, ha='center', va='bottom', zorder=4, bbox=dict(facecolor='white', alpha=0.6, edgecolor='none', pad=0.5))
     ax.axis('on'); ax.set_xlabel('Principal Component 1', fontsize=14, fontweight='bold'); ax.set_ylabel('Principal Component 2', fontsize=14, fontweight='bold')
-    ax.set_title(f"Raw Conformational Scatter & Kinetic Flow ({temp} K)", fontsize=16, fontweight='bold', pad=20)
+    ax.set_title(f"Conformational Scatter & Observed Transition Flow ({temp} K)", fontsize=16, fontweight='bold', pad=20)
     fig.savefig(out_file, dpi=PLOT_DPI, bbox_inches='tight')
     plt.close(fig)
 
@@ -352,7 +368,7 @@ def render_pcoa_centroids(num_states, data_nd, labels, states, directed_transiti
         ax.scatter(cx, cy, s=150, color='black', zorder=2)
         ax.text(cx, cy + 0.05, str(state), color='black', fontweight='bold', fontsize=11, ha='center', va='bottom', zorder=3)
     ax.axis('on'); ax.set_xlabel('1st PCoA Dimension', fontsize=14, fontweight='bold'); ax.set_ylabel('2nd PCoA Dimension', fontsize=14, fontweight='bold')
-    ax.set_title(f"Principal Coordinate Analysis of Cluster Centroids ({temp} K)", fontsize=16, fontweight='bold', pad=20)
+    ax.set_title(f"Principal Coordinate Analysis of Cluster Median Coordinates ({temp} K)", fontsize=16, fontweight='bold', pad=20)
     fig.savefig(out_file, dpi=PLOT_DPI, bbox_inches='tight')
     plt.close(fig)
 
@@ -402,9 +418,9 @@ def execute_carma_sandbox(cmd_list, run_dir='.'):
 def _process_single_cluster(cid, index, total_clusters, labels, frames, data_nd, abs_original_dcd, abs_original_psf, abs_results_dir, extraction_flags, args, carma_stats, cluster_rmsds, fh):
     """Isolates the structural processing, alignment, and rendering for a single cluster."""
     total_str = f"({index+1:4d}/{total_clusters:4d})"
-    sys.stdout.write(f"\r    -> Cluster {cid:4d} {total_str} : Processing structural core...        ")
+    sys.stdout.write(f"\r    -> Cluster {cid:4d} {total_str} : Processing structural ensemble...        ")
     sys.stdout.flush()
-    fh.stream.write(f"    -> Processing Structural Core: Cluster {cid:4d}...\n")
+    fh.stream.write(f"    -> Processing structural ensemble: Cluster {cid:4d}...\n")
     fh.flush()
     
     cluster_mask = (labels == cid)
@@ -433,7 +449,7 @@ def _process_single_cluster(cid, index, total_clusters, labels, frames, data_nd,
             logging.error(f"Failed to extract cluster {cid} frames.")
             return
         
-        fh.stream.write(f"      -> Phase 1: Pre-fitting cluster to PCA medoid...\n")
+        fh.stream.write(f"      -> Phase 1: Aligning cluster ensemble to representative frame...\n")
         t_sub = time.time()
         execute_carma_sandbox(["carma", "-v", "-w", "-cov"] + extraction_flags + [temp_full_dcd, abs_original_psf], run_dir=tmp_dir)
         execute_carma_sandbox(["carma", "-v", "-w", "-fit", "-reference", str(medoid_idx_carma)] + extraction_flags + [temp_full_dcd, abs_original_psf], run_dir=tmp_dir)
@@ -476,15 +492,15 @@ def _process_single_cluster(cid, index, total_clusters, labels, frames, data_nd,
                 cluster_rmsds[cid] = float(np.max(rmsd_values))
                 
                 if args.rmsd > 0.0:
-                    fh.stream.write(f"      -> Phase 3: Executing RMSD Filter from Average (Threshold: {args.rmsd} A)...\n")
+                    fh.stream.write(f"      -> Phase 3: Applying RMSD-based structural filtering relative to the average structure (Threshold: {args.rmsd} A)...\n")
                     fh.flush()
                     core_mask = rmsd_values <= args.rmsd
                     retained_count = np.sum(core_mask)
                     
                     if retained_count > 0:
                         core_cluster_frames = cluster_frames[core_mask]
-                        fh.stream.write(f"      -> Filter applied successfully: Retained {retained_count}/{initial_frame_count} core frames.\n")
-                        sys.stdout.write(f"\r    -> Cluster {cid:4d} {total_str} : Retained {retained_count}/{initial_frame_count} core frames.        \n")
+                        fh.stream.write(f"      -> Filter applied successfully: Retained {retained_count}/{initial_frame_count} frames in the RMSD-filtered structural ensemble.\n")
+                        sys.stdout.write(f"\r    -> Cluster {cid:4d} {total_str} : Retained {retained_count}/{initial_frame_count} frames after RMSD filtering.        \n")
                         
                         np.savetxt(temp_frames_dat, core_cluster_frames, fmt='%d')
                         t_sub = time.time()
@@ -518,7 +534,7 @@ def _process_single_cluster(cid, index, total_clusters, labels, frames, data_nd,
                         cluster_frames = core_cluster_frames
                     else:
                         sys.stdout.write(f"\r    -> Cluster {cid:4d} {total_str} : [WARNING] 0 frames passed filter.          \n")
-                        logging.warning(f"\n      {Colors.YELLOW}[-]{Colors.RESET} Warning: Zero frames satisfy threshold for Cluster {cid}. Retaining complete ensemble.")
+                        logging.warning(f"\n      {Colors.YELLOW}[-]{Colors.RESET} Warning: No frames satisfy the RMSD threshold for Cluster {cid}. Retaining the complete structural ensemble.")
                         shutil.copy(temp_fitted_dcd, os.path.join(abs_results_dir, f"cluster_{cid:04d}.dcd"))
                 else:
                     sys.stdout.write(f"\r    -> Cluster {cid:4d} {total_str} : Extracted {initial_frame_count} frames.                 \n")
@@ -533,13 +549,17 @@ def _process_single_cluster(cid, index, total_clusters, labels, frames, data_nd,
         execute_carma_sandbox(["carma", "-v", "-first", str(medoid_frame), "-last", str(medoid_frame), "-pdb"] + extraction_flags + [abs_original_dcd, abs_original_psf], run_dir=tmp_dir)
         extracted_pdbs = [f for f in glob.glob(os.path.join(tmp_dir, "*.pdb")) if "superposition" not in f and "average" not in f]
         if extracted_pdbs:
-            os.rename(extracted_pdbs[0], os.path.join(abs_results_dir, f"cluster_{cid:04d}_medoid.pdb"))
+            os.rename(extracted_pdbs[0], os.path.join(abs_results_dir, f"cluster_{cid:04d}_representative.pdb"))
         
         sys.stdout.flush()
         fh.flush()
 
 def execute_structural_extraction(unique_clusters, labels, frames, data_nd, target_analysis_dir, results_dir, args, carma_stats, cluster_rmsds):
-    """Main loop managing trajectory slicing, alignment, and medoid creation via CARMA."""
+    """Main loop managing trajectory slicing, alignment, and representative-structure extraction via CARMA."""
+    if not shutil.which("carma"):
+        logging.warning(f"\n{Colors.YELLOW}[-]{Colors.RESET} Warning: 'carma' binary not found in system $PATH. Bypassing structural extraction.")
+        return
+
     search_link_dir = target_analysis_dir
     if 'carma_results_' not in target_analysis_dir:
         carma_dirs = glob.glob(os.path.join(target_analysis_dir, 'carma_results_*'))
@@ -584,7 +604,7 @@ def execute_structural_extraction(unique_clusters, labels, frames, data_nd, targ
             extraction_flags, args, carma_stats, cluster_rmsds, fh
         )
 
-    logging.info(f"    {Colors.BLUE}[*]{Colors.RESET} Processing transition cluster (Cluster -1)...\n")
+    logging.info(f"    {Colors.BLUE}[*]{Colors.RESET} Processing unassigned/noise configurations (label -1)...\n")
     noise_mask = (labels == -1)
     if np.any(noise_mask):
         with tempfile.TemporaryDirectory(dir=abs_results_dir) as tmp_dir:
@@ -594,7 +614,7 @@ def execute_structural_extraction(unique_clusters, labels, frames, data_nd, targ
             execute_carma_sandbox(["carma", "-v", "-sort", "temp_frames_noise.dat", abs_original_dcd], run_dir=tmp_dir)
             carma_stats['sort'] += (time.time() - t_sub)
             if os.path.exists(os.path.join(tmp_dir, "carma.reordered.dcd")): 
-                os.rename(os.path.join(tmp_dir, "carma.reordered.dcd"), os.path.join(abs_results_dir, "transitions_noise.dcd"))
+                os.rename(os.path.join(tmp_dir, "carma.reordered.dcd"), os.path.join(abs_results_dir, "unassigned_noise.dcd"))
 
     logging.info(f"{Colors.BLUE}[+]{Colors.RESET} Structural extraction complete. Trajectories and representative structures exported.")
 
@@ -603,7 +623,7 @@ def execute_structural_extraction(unique_clusters, labels, frames, data_nd, targ
 # 7. PIPELINE EXECUTION
 # =========================================================================
 def run_full_pipeline(args, data_file, results_dir, target_analysis_dir):
-    """Executes the complete Clustering, Transitions, Visualizing, and Extracting sequence."""
+    """Executes the complete clustering, observed-transition, visualization, and structural-extraction sequence."""
     import matplotlib
     matplotlib.use('Agg') # Safe headless execution
 
@@ -616,6 +636,10 @@ def run_full_pipeline(args, data_file, results_dir, target_analysis_dir):
     # 1. LOADING
     t0 = time.time()
     raw_data = ingest_trajectory_data(data_file, step=args.step)
+    
+    if len(raw_data) < 2:
+        logging.error(f"{Colors.RED}[-]{Colors.RESET} Critical Error: Insufficient valid frames sampled ({len(raw_data)}). Minimum 2 required.")
+        sys.exit(1)
         
     if args.step > 1:
         logging.info(f"{Colors.LIGHT_BLUE}[*]{Colors.RESET} Applied frame stride of {args.step} during ingestion.")
@@ -623,7 +647,10 @@ def run_full_pipeline(args, data_file, results_dir, target_analysis_dir):
     frames = raw_data[:, 0].astype(int)
     data_nd = raw_data[:, 1:] 
     
-    if args.dim > 0 and args.dim < data_nd.shape[1]:
+    if args.dim > 0:
+        if args.dim > data_nd.shape[1]:
+            logging.warning(f"{Colors.YELLOW}[-]{Colors.RESET} Warning: Requested --dim {args.dim} exceeds available dimensions ({data_nd.shape[1]}). Capping to {data_nd.shape[1]}.")
+            args.dim = data_nd.shape[1]
         data_nd = data_nd[:, :args.dim]
         logging.info(f"{Colors.LIGHT_BLUE}[*]{Colors.RESET} Constraining multidimensional analysis to the primary {args.dim} dimensions.")
         
@@ -640,8 +667,24 @@ def run_full_pipeline(args, data_file, results_dir, target_analysis_dir):
         dynamic_size = args.size
         dynamic_samples = args.samples if args.samples is not None else max(2, int(dynamic_size / 10.0))
 
+    # Console analysis summary (presentation only; no change to analysis logic)
+    auto_status_console = "Active" if args.auto else "Inactive (manual parameters)"
+    logging.info("\n" + "="*70)
+    logging.info(f"{Colors.BOLD} ANALYSIS SETUP{Colors.RESET}")
+    logging.info("="*70)
+    logging.info(f"  Projection file      : {os.path.basename(data_file)}")
+    logging.info(f"  Frames analyzed      : {total_frames:,}")
+    logging.info(f"  Frame stride         : {args.step}")
+    logging.info(f"  Dimensions used      : {n_dimensions}")
+    logging.info(f"  Temperature          : {args.temp} K")
+    logging.info(f"  HDBSCAN method       : {args.method}")
+    logging.info(f"  min_cluster_size     : {dynamic_size}")
+    logging.info(f"  min_samples          : {dynamic_samples}")
+    logging.info(f"  Auto-scaling         : {auto_status_console}")
+    logging.info("="*70)
+
     # 2. CLUSTERING
-    logging.info(f"\n{Colors.LIGHT_BLUE}[*]{Colors.RESET} Executing HDBSCAN clustering (Method: {args.method})...")
+    logging.info(f"\n{Colors.LIGHT_BLUE}[*]{Colors.RESET} Running HDBSCAN clustering...")
     labels, timing_stats['hdbscan'] = execute_clustering_algorithm(data_nd, dynamic_size, dynamic_samples, args.method)
     
     # Inline calculation to restore the exact terminal output
@@ -652,11 +695,20 @@ def run_full_pipeline(args, data_file, results_dir, target_analysis_dir):
     labels, unique_clusters = sort_cluster_populations(labels)
 
     noise_frames = np.sum(labels == -1)
-    logging.info("\n    Population Distribution:")
+    assigned_frames = total_frames - noise_frames
+    logging.info("\n    CLUSTER POPULATIONS")
+    logging.info("    " + "-"*49)
+    logging.info(f"    {'Cluster':<10}{'Frames':>12}{'Population':>15}")
+    logging.info("    " + "-"*49)
     for cid in unique_clusters:
         count = np.sum(labels == cid)
-        logging.info(f"      Cluster {cid:4d}: {count:7d} frames ({(count / total_frames) * 100:5.1f}%)")
-    logging.info(f"      Transition: {noise_frames:7d} frames ({(noise_frames / total_frames) * 100:5.1f}%)")
+        logging.info(f"    {cid:<10d}{count:>12,d}{(count / total_frames) * 100:>14.1f}%")
+    logging.info("    " + "-"*49)
+    logging.info(f"    {'Unassigned':<10}{noise_frames:>12,d}{(noise_frames / total_frames) * 100:>14.1f}%")
+    logging.info("    " + "-"*49)
+    logging.info(f"    Assigned frames    : {assigned_frames:,} ({(assigned_frames / total_frames) * 100:.1f}%)")
+    logging.info(f"    Unassigned / noise : {noise_frames:,} ({(noise_frames / total_frames) * 100:.1f}%)")
+    logging.info(f"    Clusters identified: {len(unique_clusters)}")
 
     t0 = time.time()
     out_filename = os.path.join(results_dir, f"hdbscan.{n_dimensions}-D.clusters.dat")
@@ -665,32 +717,32 @@ def run_full_pipeline(args, data_file, results_dir, target_analysis_dir):
     timing_stats['export'] = time.time() - t0
 
     # 3. TRANSITIONS
-    logging.info(f"{Colors.LIGHT_BLUE}[*]{Colors.RESET} Calculating Transition Matrices...")
+    logging.info(f"{Colors.LIGHT_BLUE}[*]{Colors.RESET} Mapping observed changes between assigned cluster labels...")
     states, counts, population_map, free_energies, k_B_T = calculate_thermodynamic_energies(labels, args.temp)
     num_states = len(states)
     transitions, directed_transitions = map_kinetic_pathways(labels)
 
     sorted_jumps = print_top_transition_jumps(transitions, args.top)
-    jumps_file = os.path.join(results_dir, "kinetic_jumps_report.txt")
+    jumps_file = os.path.join(results_dir, "observed_transitions_report.txt")
     with open(jumps_file, "w") as jf:
-        jf.write("=== KINETIC TRANSITION PATHWAYS ===\n")
-        jf.write(f"Total Unique Pathways: {len(transitions)}\n\n")
-        jf.write(f"{'Edge (A <-> B)':<20} | {'Jump Count':<10}\n")
+        jf.write("=== OBSERVED CLUSTER-TO-CLUSTER TRANSITIONS ===\n")
+        jf.write(f"Unique observed cluster pairs: {len(transitions)}\n\n")
+        jf.write(f"{'Cluster pair':<20} | {'Observed changes':<16}\n")
         jf.write("-" * 35 + "\n")
         for edge, count in sorted_jumps:
-            jf.write(f"Cluster {edge[0]:4d} <--> Cluster {edge[1]:4d} | {count:5d} jumps\n")
-    logging.info(f"{Colors.BLUE}[+]{Colors.RESET} Full transition frequency log saved to: {jumps_file}")
+            jf.write(f"Cluster {edge[0]:4d} <--> Cluster {edge[1]:4d} | {count:5d}\n")
+    logging.info(f"{Colors.BLUE}[+]{Colors.RESET} Observed-transition report saved to: {jumps_file}")
 
     if args.transitions is not None and len(args.transitions) == 2:
         logging.info("\n" + "="*85)
-        logging.info(f"{Colors.LIGHT_BLUE}[*]{Colors.RESET} DIAGNOSTIC MODE: VALIDATING TRANSITIONS FOR EDGE {tuple(sorted(args.transitions))}")
+        logging.info(f"{Colors.LIGHT_BLUE}[*]{Colors.RESET} DIAGNOSTIC MODE: INSPECTING OBSERVED TRANSITIONS FOR CLUSTER PAIR {tuple(sorted(args.transitions))}")
         logging.info("="*85)
         hunt_chronological_jump_events(tuple(sorted(args.transitions)), labels, frames, data_nd, args.events)
 
     # 4. VISUALIZING
-    logging.info(f"\n{Colors.LIGHT_BLUE}[*]{Colors.RESET} Generating Graphical Projections & Kinetic Networks...")
+    logging.info(f"\n{Colors.LIGHT_BLUE}[*]{Colors.RESET} Generating conformational projections, free-energy surfaces, and transition visualizations...")
     t0_plots = time.time()
-    pc1, pc2 = data_nd[:, 0], data_nd[:, 1]
+    pc1, pc2 = data_nd[:, 0], data_nd[:, 1] if n_dimensions >= 2 else (None, None)
 
     if n_dimensions >= 2:
         x_pad, y_pad = (pc1.max() - pc1.min()) * 0.05, (pc2.max() - pc2.min()) * 0.05
@@ -700,40 +752,42 @@ def run_full_pipeline(args, data_file, results_dir, target_analysis_dir):
         logging.info(f"    -> Rendering Topographic Free Energy Surface (FES) at {args.temp} K...")
         render_free_energy_surface(pc1, pc2, unique_clusters, labels, k_B_T, args.temp, xl12, yl12, os.path.join(results_dir, "FES_Landscape_2D_PC1_vs_PC2.png"))
 
+        logging.info(f"    -> Rendering observed transition network...")
+        pos = render_kinetic_network(states, free_energies, population_map, transitions, args.min_jumps, pc1, pc2, labels, args.temp, os.path.join(results_dir, "Observed_Transition_Network.png"))
+
+        logging.info(f"    -> Rendering conformational scatter with directed observed-transition flow...")
+        render_kinetic_flow_scatter(pc1, pc2, directed_transitions, pos, args.temp, os.path.join(results_dir, "Scatter_Observed_Transitions.png"))
+    else:
+        logging.info(f"    -> Bypassing 2D topographic and network visualizations (1D input detected).")
+
     if n_dimensions >= 3:
         z_pad = (data_nd[:, 2].max() - data_nd[:, 2].min()) * 0.05
         zl13 = (data_nd[:, 2].min() - z_pad, data_nd[:, 2].max() + z_pad)
         render_conformational_landscape(data_nd[:, 0], data_nd[:, 2], xl12, zl13, "PC1", "PC3", unique_clusters, labels, os.path.join(results_dir, "landscape_PC1_vs_PC3"))
         render_conformational_landscape(data_nd[:, 1], data_nd[:, 2], yl12, zl13, "PC2", "PC3", unique_clusters, labels, os.path.join(results_dir, "landscape_PC2_vs_PC3"))
 
-    logging.info(f"    -> Rendering Kinetic Network Map...")
-    pos = render_kinetic_network(states, free_energies, population_map, transitions, args.min_jumps, pc1, pc2, labels, args.temp, os.path.join(results_dir, "Kinetic_Network_Graph.png"))
-
     logging.info(f"    -> Rendering Free Energy Disconnectivity Graph...")
     if num_states > 1:
         render_disconnectivity_graph(num_states, states, directed_transitions, counts, free_energies, k_B_T, args.temp, os.path.join(results_dir, "Disconnectivity_Graph.png"))
 
-    logging.info(f"    -> Rendering Conformational Scatter with Directed Kinetic Flow...")
-    render_kinetic_flow_scatter(pc1, pc2, directed_transitions, pos, args.temp, os.path.join(results_dir, "Scatter_Kinetic_Overlay.png"))
-
-    logging.info(f"    -> Rendering Multidimensional Scaling (PCoA) of Cluster Centroids...")
+    logging.info(f"    -> Rendering principal coordinate analysis (PCoA) of cluster median coordinates...")
     if num_states > 2:
-        render_pcoa_centroids(num_states, data_nd, labels, states, directed_transitions, args.temp, os.path.join(results_dir, "PCoA_Centroids_Graph.png"))
+        render_pcoa_centroids(num_states, data_nd, labels, states, directed_transitions, args.temp, os.path.join(results_dir, "PCoA_Cluster_Medians.png"))
 
     timing_stats['plots'] = time.time() - t0_plots
 
     # 5. EXTRACTING
-    logging.info(f"\n{Colors.LIGHT_BLUE}[*]{Colors.RESET} Initiating automated structural extraction via CARMA...")
+    logging.info(f"\n{Colors.LIGHT_BLUE}[*]{Colors.RESET} Extracting cluster-associated structural ensembles via CARMA...")
     t0_extract = time.time()
     execute_structural_extraction(unique_clusters, labels, frames, data_nd, target_analysis_dir, results_dir, args, carma_stats, cluster_rmsds)
     timing_stats['extract'] = time.time() - t0_extract
 
     # 6. REPORT GENERATION
-    logging.info(f"\n{Colors.LIGHT_BLUE}[*]{Colors.RESET} Compiling Execution & Resource Utilization Report...")
-    generate_execution_report(results_dir, pipeline_start, process, total_frames, args, n_dimensions, dynamic_size, dynamic_samples, target_analysis_dir, timing_stats, carma_stats, unique_clusters, labels, cluster_rmsds)
+    logging.info(f"\n{Colors.LIGHT_BLUE}[*]{Colors.RESET} Writing detailed analysis report...")
+    generate_execution_report(results_dir, pipeline_start, process, total_frames, args, n_dimensions, dynamic_size, dynamic_samples, target_analysis_dir, data_file, timing_stats, carma_stats, unique_clusters, labels, cluster_rmsds)
 
 def run_diagnostic_validation(args, dat_file):
-    """Bypasses heavy imports; precisely validates chronological phase jumps."""
+    """Bypasses the full pipeline and inspects chronological observed label changes."""
     raw_data = ingest_trajectory_data(dat_file, step=1)
         
     frames = raw_data[:, 0].astype(int)
@@ -744,9 +798,9 @@ def run_diagnostic_validation(args, dat_file):
         
     logging.info("\n" + "="*85)
     if len(args.transitions) == 2:
-        logging.info(f"{Colors.LIGHT_BLUE}[*]{Colors.RESET} DIAGNOSTIC MODE: VALIDATING TRANSITIONS FOR EDGE {tuple(sorted(args.transitions))}")
+        logging.info(f"{Colors.LIGHT_BLUE}[*]{Colors.RESET} DIAGNOSTIC MODE: INSPECTING OBSERVED TRANSITIONS FOR CLUSTER PAIR {tuple(sorted(args.transitions))}")
     else:
-        logging.info(f"{Colors.LIGHT_BLUE}[*]{Colors.RESET} DIAGNOSTIC MODE: TOP KINETIC JUMPS OVERVIEW")
+        logging.info(f"{Colors.LIGHT_BLUE}[*]{Colors.RESET} DIAGNOSTIC MODE: OBSERVED TRANSITION OVERVIEW")
     logging.info("="*85)
     
     print_top_transition_jumps(transitions, args.top)
@@ -757,7 +811,7 @@ def run_diagnostic_validation(args, dat_file):
     logging.info(f"{Colors.BLUE}[+]{Colors.RESET} Validation complete. Exiting smoothly without triggering extraction pipeline.\n")
     sys.exit(0)
 
-def generate_execution_report(results_dir, pipeline_start, process, total_frames, args, n_dimensions, dynamic_size, dynamic_samples, target_analysis_dir, timing_stats, carma_stats, unique_clusters, labels, cluster_rmsds):
+def generate_execution_report(results_dir, pipeline_start, process, total_frames, args, n_dimensions, dynamic_size, dynamic_samples, target_analysis_dir, data_file, timing_stats, carma_stats, unique_clusters, labels, cluster_rmsds):
     
     def calculate_variance_explained(dim_used, target_dir):
         eig_files = glob.glob(os.path.join(target_dir, '*eigenvalues.dat'))
@@ -769,64 +823,94 @@ def generate_execution_report(results_dir, pipeline_start, process, total_frames
             used_variance = np.sum(eigenvalues[:dim_used])
             return f"{(used_variance / total_variance) * 100:.1f}%"
         except (FileNotFoundError, ValueError, IndexError) as e: 
-            logging.warning(f"{Colors.YELLOW}[-]{Colors.RESET} Warning: Unable to calculate structural variance ({e}).")
+            logging.warning(f"{Colors.YELLOW}[-]{Colors.RESET} Warning: Unable to calculate represented variance ({e}).")
             return "Error"
 
     report_filename = os.path.join(results_dir, "pipeline_report.txt")
     total_pipeline_time = time.time() - pipeline_start
-    peak_ram_gb = process.memory_info().rss / (1024 ** 3) 
+    resident_ram_gb = process.memory_info().rss / (1024 ** 3)
     cpu_cores = psutil.cpu_count(logical=True)
     variance_str = calculate_variance_explained(args.dim, target_analysis_dir)
+    noise_frames = np.sum(labels == -1)
+    assigned_frames = total_frames - noise_frames
+    auto_status = "Active (sub-linear heuristic)" if args.auto else "Inactive (manual parameters)"
 
     with open(report_filename, "w") as report:
-        report.write("==================================================\n")
-        report.write("PIPELINE EXECUTION & RESOURCE UTILIZATION REPORT\n")
-        report.write("==================================================\n\n")
-        report.write("--- ANALYSIS PARAMETERS ---\n")
-        report.write(f"Total Frames Processed : {total_frames:,}\n")
-        report.write(f"Frame Stride           : {args.step}\n")
-        report.write(f"Dimensionality Subspace: {n_dimensions} (Capturing {variance_str} of structural variance)\n")
-        report.write(f"Clustering Methodology : {args.method}\n")
-        
-        auto_status = "Active (Sub-linear scaling)" if args.auto else "Inactive (Manual)"
-        report.write(f"Auto-Scaling           : {auto_status}\n")
-        report.write(f"Minimum Cluster Volume : {dynamic_size} frames\n")
-        report.write(f"Minimum Density Samples: {dynamic_samples} frames\n")
-        
-        report.write(f"Structural Core Filter : {'Active' if args.rmsd > 0 else 'Inactive'}\n")
-        report.write(f"Simulation Temp        : {args.temp} K\n")
-        report.write(f"Target SegID           : {args.segid if args.segid else 'ALL'}\n\n")
-        report.write("--- SYSTEM PROFILING & COMPUTATIONAL EFFICIENCY ---\n")
-        report.write(f"Logical Cores Utilized : {cpu_cores}\n")
-        report.write(f"Peak Memory Allocation : {peak_ram_gb:.2f} GB\n")
-        report.write(f"Total Pipeline Runtime : {format_duration(total_pipeline_time)}\n\n")
-        
-        report.write("[ Execution Breakdown ]\n")
-        report.write(f"  Data Ingestion (I/O) : {timing_stats.get('load', 0):7.2f} s\n")
-        report.write(f"  HDBSCAN Algorithm    : {timing_stats.get('hdbscan', 0):7.2f} s\n")
-        report.write(f"  Coordinate Export    : {timing_stats.get('export', 0):7.2f} s\n")
-        report.write(f"  FES Visualization    : {timing_stats.get('plots', 0):7.2f} s\n")
-        report.write(f"  CARMA Processing     : {timing_stats.get('extract', 0):7.2f} s\n")
-        report.write(f"    ├── Extraction     : {carma_stats.get('sort', 0):7.2f} s\n")
-        report.write(f"    ├── RMSD Alignment : {carma_stats.get('rmsd', 0):7.2f} s\n")
-        report.write(f"    └── Superposition  : {carma_stats.get('super', 0):7.2f} s\n\n")
-        
-        report.write("--- THERMODYNAMIC POPULATIONS ---\n") 
+        report.write("============================================================\n")
+        report.write("clusterMD ANALYSIS REPORT\n")
+        report.write("============================================================\n\n")
+
+        report.write("--- INPUT & ANALYSIS CONFIGURATION ---\n")
+        report.write(f"Projection file          : {os.path.basename(data_file)}\n")
+        report.write(f"Frames analyzed          : {total_frames:,}\n")
+        report.write(f"Frame stride             : {args.step}\n")
+        report.write(f"Dimensions used          : {n_dimensions}\n")
+        report.write(f"Variance within supplied PC set : {variance_str}\n")
+        report.write(f"Simulation temperature   : {args.temp} K\n")
+        report.write(f"Target segment           : {args.segid if args.segid else 'ALL'}\n\n")
+
+        report.write("--- HDBSCAN PARAMETERS ---\n")
+        report.write(f"Cluster selection method : {args.method}\n")
+        report.write(f"Auto-scaling             : {auto_status}\n")
+        report.write(f"min_cluster_size         : {dynamic_size}\n")
+        report.write(f"min_samples              : {dynamic_samples}\n\n")
+
+        report.write("--- STRUCTURAL PROCESSING ---\n")
+        report.write(f"RMSD structural filter   : {'Active' if args.rmsd > 0 else 'Inactive'}\n")
+        if args.rmsd > 0:
+            report.write(f"RMSD threshold           : {args.rmsd} Å\n")
+        report.write("Representative structure : observed frame nearest the arithmetic centroid\n")
+        report.write("Unassigned label         : -1\n")
+        report.write("Unassigned interpretation: retained as unassigned/noise configurations\n\n")
+
+        report.write("--- RESULTS SUMMARY ---\n")
+        report.write(f"Clusters identified      : {len(unique_clusters)}\n")
+        report.write(f"Assigned frames          : {assigned_frames:,} ({(assigned_frames / total_frames) * 100:.2f}%)\n")
+        report.write(f"Unassigned/noise frames  : {noise_frames:,} ({(noise_frames / total_frames) * 100:.2f}%)\n\n")
+
+        report.write("--- SYSTEM & RUNTIME ---\n")
+        report.write(f"Logical CPU cores detected : {cpu_cores}\n")
+        report.write(f"Process RSS at report time : {resident_ram_gb:.2f} GB\n")
+        report.write(f"Total pipeline runtime     : {format_duration(total_pipeline_time)}\n\n")
+
+        report.write("[ Measured stage runtimes ]\n")
+        report.write(f"  Data ingestion (I/O)     : {timing_stats.get('load', 0):7.2f} s\n")
+        report.write(f"  HDBSCAN clustering       : {timing_stats.get('hdbscan', 0):7.2f} s\n")
+        report.write(f"  Coordinate export        : {timing_stats.get('export', 0):7.2f} s\n")
+        report.write(f"  Visualization            : {timing_stats.get('plots', 0):7.2f} s\n")
+        report.write(f"  CARMA structural process : {timing_stats.get('extract', 0):7.2f} s\n")
+        report.write(f"    ├── Frame extraction   : {carma_stats.get('sort', 0):7.2f} s\n")
+        report.write(f"    ├── Alignment/RMSD     : {carma_stats.get('rmsd', 0):7.2f} s\n")
+        report.write(f"    └── Superposition      : {carma_stats.get('super', 0):7.2f} s\n\n")
+
+        report.write("--- CLUSTER POPULATION & STRUCTURAL SUMMARY ---\n")
+        report.write(f"{'Cluster':>8} {'Frames':>12} {'Population':>12} {'Max RMSD to average (Å)':>24}\n")
+        report.write("-" * 60 + "\n")
         for cid in unique_clusters:
             count = np.sum(labels == cid)
             percentage = (count / total_frames) * 100
-            rmsd_str = f"{cluster_rmsds.get(cid, -1.0):.2f} A" if cluster_rmsds.get(cid, -1.0) >= 0 else "N/A"
-            report.write(f"  Cluster {cid:4d} : {count:7d} frames ({percentage:5.1f}%) | Max Internal RMSD: {rmsd_str}\n")
-        report.write("==================================================\n")
-    logging.info(f"{Colors.BLUE}[+]{Colors.RESET} Execution report successfully generated: {report_filename}")
-    logging.info(f"\n{Colors.BOLD}=== Pipeline Execution Terminated Successfully ({format_duration(total_pipeline_time)}). Data archived in {results_dir}/ ==={Colors.RESET}")
+            rmsd_str = f"{cluster_rmsds.get(cid, -1.0):.2f}" if cluster_rmsds.get(cid, -1.0) >= 0 else "N/A"
+            report.write(f"{cid:8d} {count:12,d} {percentage:11.2f}% {rmsd_str:>24}\n")
+        report.write("============================================================\n")
+
+    logging.info(f"{Colors.BLUE}[+]{Colors.RESET} Detailed report saved to: {report_filename}")
+    logging.info("\n" + "="*70)
+    logging.info(f"{Colors.BOLD} ANALYSIS COMPLETE{Colors.RESET}")
+    logging.info("="*70)
+    logging.info(f"  Frames analyzed      : {total_frames:,}")
+    logging.info(f"  Clusters identified  : {len(unique_clusters)}")
+    logging.info(f"  Assigned frames      : {assigned_frames:,} ({(assigned_frames / total_frames) * 100:.1f}%)")
+    logging.info(f"  Unassigned / noise   : {noise_frames:,} ({(noise_frames / total_frames) * 100:.1f}%)")
+    logging.info(f"  Total runtime        : {format_duration(total_pipeline_time)}")
+    logging.info(f"  Results directory    : {results_dir}/")
+    logging.info("="*70)
 
 
 # =========================================================================
 # INITIALIZATION SWITCHBOARD
 # =========================================================================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Automated HDBSCAN clustering, kinetic networks, and structural extraction pipeline.")
+    parser = argparse.ArgumentParser(description="Automated HDBSCAN clustering, observed transition mapping, and structural extraction pipeline.")
     parser.add_argument('--size', type=int, default=500, help='Explicit minimum cluster size parameter (Default: 500)')
     parser.add_argument('--samples', type=int, default=50, help='Explicit minimum samples parameter (Default: 50)')
     parser.add_argument('--auto', action='store_true', help='Autoscale size and samples based on frame count')
@@ -836,15 +920,23 @@ if __name__ == "__main__":
     parser.add_argument('--temp', type=float, default=298.0, help='Simulation temperature in Kelvin for Free Energy conversion (Default: 298.0)')
     parser.add_argument('--step', type=int, default=1, help='Frame stride for memory management on massive trajectories (Default: 1)')
     parser.add_argument('--segid', type=str, default=None, help='Target specific segment identifier for structural extraction (e.g., A)')
-    parser.add_argument('--min-jumps', type=int, default=3, help="Minimum transition events required to draw an edge (Default: 3)")
-    parser.add_argument('--transitions', nargs='*', type=int, help="Pass 0 args to view top jumps, or 2 args to validate a specific physical edge.")
-    parser.add_argument('--top', type=int, default=15, help="Number of top transitions to display in the diagnostic table (Default: 15)")
-    parser.add_argument('--events', type=int, default=3, help="Max raw transition events to print in diagnostic mode (Default: 3)")
+    parser.add_argument('--min-jumps', type=int, default=3, help="Minimum observed label changes required to draw an edge (Default: 3)")
+    parser.add_argument('--transitions', nargs='*', type=int, help="Pass 0 args to view the most frequent observed transitions, or 2 cluster IDs to inspect a specific cluster pair.")
+    parser.add_argument('--top', type=int, default=15, help="Number of observed transitions to display in the diagnostic table (Default: 15)")
+    parser.add_argument('--events', type=int, default=3, help="Maximum chronological transition events to print in diagnostic mode (Default: 3)")
 
     args = parser.parse_args()
 
+    # Input Validation Enforcements
+    if args.size <= 0: parser.error("--size must be a positive integer.")
+    if args.samples is not None and args.samples <= 0: parser.error("--samples must be a positive integer.")
+    if args.step <= 0: parser.error("--step must be a positive integer.")
+    if args.temp <= 0: parser.error("--temp must be strictly positive (K).")
+    if args.rmsd < 0: parser.error("--rmsd must be non-negative.")
+    if args.dim < 0: parser.error("--dim must be non-negative (0 for all dimensions).")
+
     if args.transitions is not None and len(args.transitions) not in [0, 2]:
-        parser.error("--transitions requires either 0 arguments (to view top jumps) or 2 arguments (to validate a specific edge).")
+        parser.error("--transitions requires either 0 arguments (overview) or 2 cluster IDs (inspect a specific pair).")
 
     clustering_flags = ['--size', '--samples', '--auto', '--method', '--dim', '--rmsd', '--step', '--segid']
     is_full_pipeline = True
@@ -855,17 +947,13 @@ if __name__ == "__main__":
             is_full_pipeline = False
 
     logging.basicConfig(level=logging.INFO, format='%(message)s', handlers=[logging.StreamHandler(sys.stdout)])
-
-    if not shutil.which("carma"):
-        logging.error(f"{Colors.RED}[-]{Colors.RESET} Critical Error: 'carma' binary not found in system $PATH.")
-        logging.error(f"{Colors.YELLOW}[*]{Colors.RESET} Please ensure CARMA is installed and accessible before running this pipeline.")
-        sys.exit(1)
+    logging.getLogger('matplotlib').setLevel(logging.WARNING)
 
     if is_full_pipeline:
-        logging.info(f"{Colors.BOLD}=== Initializing HDBSCAN & Kinetic Clustering Pipeline ==={Colors.RESET}")
+        logging.info(f"{Colors.BOLD}=== clusterMD | HDBSCAN Analysis of Molecular-Dynamics PCA Coordinates ==={Colors.RESET}")
         logging.info(f"{Colors.LIGHT_BLUE}[*]{Colors.RESET} Locating fluctuations file...")
         
-        fluctuation_files = glob.glob('*fluctuations.dat') or glob.glob('carma_results*/*fluctuations.dat') or glob.glob('../carma_results*/*fluctuations.dat')
+        fluctuation_files = glob.glob('*fluctuations.dat') or glob.glob('carma_results*/*fluctuations.dat') or glob.glob('../*fluctuations.dat') or glob.glob('../carma_results*/*fluctuations.dat')
 
         if not fluctuation_files:
             logging.error(f"{Colors.RED}[-]{Colors.RESET} Critical Error: '*fluctuations.dat' not found in current directory, or any 'carma_results*' subdirectories/parent directories.")
@@ -898,7 +986,7 @@ if __name__ == "__main__":
             sys.exit(130)
 
     else:
-        logging.info(f"{Colors.BOLD}=== Initializing Post-Run Transition Validation ==={Colors.RESET}")
+        logging.info(f"{Colors.BOLD}=== clusterMD | Post-Run Observed-Transition Inspection ==={Colors.RESET}")
         dat_files = glob.glob("hdbscan.*-D.clusters.dat")
         
         if not dat_files:
